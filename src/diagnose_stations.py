@@ -6,7 +6,7 @@ import asyncio
 
 import aiohttp
 
-from radio import STATIONS, RadioError, RadioService
+from src.radio import STATIONS, RadioError, RadioService
 
 
 async def check_station(service: RadioService, key: str, title: str) -> tuple[str, str]:

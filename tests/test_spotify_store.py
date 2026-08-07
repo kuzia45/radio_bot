@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from spotify_store import SpotifyStore, StoredSpotifyToken
+from src.spotify_store import SpotifyStore, StoredSpotifyToken
 
 
 class SpotifyStoreTests(unittest.TestCase):

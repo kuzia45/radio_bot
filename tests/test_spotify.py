@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import patch
 
-from spotify import (
+from src.spotify import (
     SpotifyConfig,
     build_authorization_url,
     fetch_all_liked_tracks,
@@ -47,7 +47,7 @@ class SpotifyPreparationTests(unittest.TestCase):
         self.assertFalse(SpotifyConfig("id", "", "callback").is_configured)
         self.assertTrue(SpotifyConfig("id", "secret", "callback").is_configured)
 
-    @patch("spotify.secrets.token_urlsafe", return_value="nonce")
+    @patch("src.spotify.secrets.token_urlsafe", return_value="nonce")
     def test_authorization_url_requests_library_access(self, _: object) -> None:
         config = SpotifyConfig("client id", "secret", "https://example.com/callback")
         url = build_authorization_url(config, 42)

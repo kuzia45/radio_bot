@@ -9,6 +9,7 @@ import re
 import time
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import urljoin
 
 import aiohttp
 
@@ -59,8 +60,8 @@ STATIONS: tuple[Station, ...] = (
         "Энерджи",
         "NRJ Russia",
         ("nrj russia", "energy russia", "радио energy"),
-        "https://www.energyfm.ru/live",
-        "energy",
+        "https://hls-01-gpm.hostingradio.ru/energyfm495/128/playlist.m3u8",
+        "hls_metadata",
     ),
     Station(
         "love",
@@ -159,6 +160,12 @@ def parse_official_page(page: str, parser: str, slug: str | None = None) -> str 
         if payload.get("ok") is True and isinstance(title, str):
             return re.sub(r"\s+", " ", title).strip() or None
 
+    if parser == "hls_metadata":
+        artist = re.search(r'X-ARTIST="([^"]+)"', page)
+        title = re.search(r'X-TITLE="([^"]+)"', page)
+        if artist and title:
+            return f"{html.unescape(artist.group(1))} - {html.unescape(title.group(1))}"
+
     if parser == "love":
         artist = re.search(
             r'class="player-track__artist"[^>]*>\s*(.*?)\s*</p>', page, re.DOTALL
@@ -245,18 +252,37 @@ class RadioService:
         return None
 
     async def _read_official_page(self, station: Station) -> str | None:
+        browser_headers = {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/127.0 Safari/537.36"
+            )
+        }
         try:
             async with self.session.get(
                 station.official_url,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 Chrome/127.0 Safari/537.36"
-                    )
-                },
+                headers=browser_headers,
             ) as response:
                 response.raise_for_status()
                 page = await response.text(errors="replace")
+                if station.official_parser == "hls_metadata":
+                    variant = next(
+                        (
+                            line.strip()
+                            for line in page.splitlines()
+                            if line.strip() and not line.startswith("#")
+                        ),
+                        None,
+                    )
+                    if not variant:
+                        return None
+                    variant_url = urljoin(str(response.url), variant)
+                    async with self.session.get(
+                        variant_url,
+                        headers=browser_headers,
+                    ) as variant_response:
+                        variant_response.raise_for_status()
+                        page = await variant_response.text(errors="replace")
         except (aiohttp.ClientError, asyncio.TimeoutError):
             return None
         return parse_official_page(

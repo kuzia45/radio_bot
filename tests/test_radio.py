@@ -1,6 +1,6 @@
 import unittest
 
-from radio import STATIONS_BY_KEY, parse_icy_metadata, parse_official_page
+from src.radio import STATIONS_BY_KEY, parse_icy_metadata, parse_official_page
 
 
 class ParseIcyMetadataTests(unittest.TestCase):
@@ -58,6 +58,10 @@ class ParseIcyMetadataTests(unittest.TestCase):
     def test_json_title(self) -> None:
         page = '{"ok": true, "title": "Artist  -  Song"}'
         self.assertEqual(parse_official_page(page, "json_title"), "Artist - Song")
+
+    def test_hls_metadata(self) -> None:
+        page = '#EXT-X-DATERANGE:X-ARTIST="A &amp; B",X-TITLE="New Song"'
+        self.assertEqual(parse_official_page(page, "hls_metadata"), "A & B - New Song")
 
     def test_utf8_title(self) -> None:
         block = (

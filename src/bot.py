@@ -9,6 +9,7 @@ import logging
 import os
 import time
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
@@ -31,8 +32,8 @@ from aiogram.types import (
 from aiohttp import web
 from dotenv import load_dotenv
 
-from radio import STATIONS, STATIONS_BY_KEY, RadioError, RadioService, Station
-from spotify import (
+from src.radio import STATIONS, STATIONS_BY_KEY, RadioError, RadioService, Station
+from src.spotify import (
     SpotifyConfig,
     SpotifyError,
     create_authorization_url,
@@ -42,14 +43,44 @@ from spotify import (
     refresh_access_token,
     tracks_match,
 )
-from spotify_store import SpotifyStore, StoredSpotifyToken
+from src.spotify_store import SpotifyStore, StoredSpotifyToken
 
 router = Router()
 logger = logging.getLogger(__name__)
+airplay_logger = logging.getLogger("airplay")
 radio_service: RadioService | None = None
 spotify_config: SpotifyConfig | None = None
 spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
+
+
+def configure_airplay_logging() -> None:
+    """Write radio history to a bounded, dedicated UTF-8 log file."""
+    Path("logs").mkdir(exist_ok=True)
+    handler = RotatingFileHandler(
+        "logs/airplay.log",
+        maxBytes=5 * 1024 * 1024,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+    airplay_logger.addHandler(handler)
+    airplay_logger.setLevel(logging.INFO)
+    airplay_logger.propagate = False
+
+
+def should_log_airplay(
+    state: dict[str, tuple[str, float]],
+    station_key: str,
+    track: str,
+    now: float,
+) -> bool:
+    """Suppress the same station/track pair for three minutes."""
+    previous = state.get(station_key)
+    if previous and previous[0] == track and now - previous[1] < 3 * 60:
+        return False
+    state[station_key] = (track, now)
+    return True
 
 
 def stations_keyboard(page: int = 0) -> InlineKeyboardMarkup:
@@ -267,6 +298,7 @@ async def get_spotify_access_token(telegram_user_id: int) -> str | None:
 async def spotify_notification_monitor(bot: Bot) -> None:
     """Notify connected users when a liked track appears on any station."""
     liked_cache: dict[int, tuple[float, list]] = {}
+    airplay_state: dict[str, tuple[str, float]] = {}
     semaphore = asyncio.Semaphore(3)
 
     async def read_station(station: Station) -> tuple[Station, str | None]:
@@ -283,6 +315,13 @@ async def spotify_notification_monitor(bot: Bot) -> None:
             station_tracks = await asyncio.gather(
                 *(read_station(station) for station in STATIONS)
             )
+            checked_at = time.monotonic()
+            for station, radio_track in station_tracks:
+                if radio_track and should_log_airplay(
+                    airplay_state, station.key, radio_track, checked_at
+                ):
+                    airplay_logger.info("%s — %s", station.title, radio_track)
+
             for telegram_user_id in spotify_store.connected_user_ids():
                 access_token = await get_spotify_access_token(telegram_user_id)
                 if not access_token:
@@ -493,6 +532,7 @@ async def main() -> None:
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
+    configure_airplay_logging()
     timeout = aiohttp.ClientTimeout(total=15, connect=6, sock_read=10)
     async with aiohttp.ClientSession(
         timeout=timeout, headers={"User-Agent": "RadioNowTelegramBot/1.0"}
