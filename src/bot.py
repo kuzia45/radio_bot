@@ -142,7 +142,8 @@ def result_keyboard(
             ],
             [
                 InlineKeyboardButton(
-                    text="🕘 Последние 10", callback_data=f"history:{station.key}"
+                    text="🎵 10 последних треков",
+                    callback_data=f"history:{station.key}",
                 ),
                 InlineKeyboardButton(
                     text="⭐ Убрать" if is_favorite else "☆ В избранное",
@@ -805,7 +806,7 @@ async def station_history(callback: CallbackQuery) -> None:
     station = STATIONS_BY_KEY.get(station_key)
     if station is None or callback.message is None:
         return
-    history = spotify_store.recent_airplay(station_key)
+    history = spotify_store.recent_airplay(station_key, limit=10)
     if not history:
         text = "История ещё не накопилась. Вернитесь через несколько минут."
     else:
@@ -816,7 +817,7 @@ async def station_history(callback: CallbackQuery) -> None:
         text = "\n".join(lines)
     await callback.answer()
     await callback.message.edit_text(
-        f"🕘 <b>{html.escape(station.title)}: последние треки</b>\n\n{text}",
+        f"🎵 <b>{html.escape(station.title)}: 10 последних треков</b>\n\n{text}",
         reply_markup=result_keyboard(station, callback.from_user.id),
     )
 
