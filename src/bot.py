@@ -9,7 +9,6 @@ import logging
 import os
 import time
 from datetime import datetime, timedelta, timezone
-from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
 
@@ -32,6 +31,7 @@ from aiogram.types import (
 from aiohttp import web
 from dotenv import load_dotenv
 
+from src.logging_config import configure_logging
 from src.radio import STATIONS, STATIONS_BY_KEY, RadioError, RadioService, Station
 from src.spotify import (
     SpotifyConfig,
@@ -59,21 +59,6 @@ spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
 MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 ALL_STATION_KEYS = {station.key for station in STATIONS}
-
-
-def configure_airplay_logging(log_dir: Path = Path("logs")) -> None:
-    """Write radio history to a bounded, dedicated UTF-8 log file."""
-    log_dir.mkdir(parents=True, exist_ok=True)
-    handler = RotatingFileHandler(
-        log_dir / "airplay.log",
-        maxBytes=5 * 1024 * 1024,
-        backupCount=3,
-        encoding="utf-8",
-    )
-    handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
-    airplay_logger.addHandler(handler)
-    airplay_logger.setLevel(logging.INFO)
-    airplay_logger.propagate = False
 
 
 def should_log_airplay(
@@ -306,6 +291,7 @@ async def connect_yandex_music(message: Message) -> None:
         telegram_user_id,
         StoredYandexToken(access_token, refresh_token, expires_at),
     )
+    logger.info("YANDEX CONNECTED | user=%s", telegram_user_id)
     await message.answer(
         "✅ Яндекс Музыка подключена. Лайки будут участвовать в уведомлениях.",
         reply_markup=start_keyboard(),
@@ -425,6 +411,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                 return station, None, str(exc)
 
     while True:
+        cycle_started = time.monotonic()
         try:
             assert radio_service is not None and spotify_store is not None
             station_tracks = await asyncio.gather(
@@ -439,7 +426,10 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                     airplay_logger.info("%s — %s", station.title, radio_track)
                     spotify_store.record_airplay(station.key, radio_track)
 
-            for telegram_user_id in spotify_store.music_user_ids():
+            user_ids = spotify_store.music_user_ids()
+            matches_found = 0
+            messages_sent = 0
+            for telegram_user_id in user_ids:
                 liked_tracks = []
                 access_token = await get_spotify_access_token(telegram_user_id)
                 if access_token:
@@ -506,6 +496,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                         radio_track,
                         delivered=not quiet,
                     )
+                    matches_found += 1
                     if not quiet:
                         await bot.send_message(
                             telegram_user_id,
@@ -516,6 +507,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                                 inline_keyboard=[music_links(radio_track)]
                             ),
                         )
+                        messages_sent += 1
 
                 now = datetime.now(MOSCOW_TZ)
                 date = now.date().isoformat()
@@ -524,10 +516,26 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                         telegram_user_id, build_daily_digest(telegram_user_id, date)
                     )
                     spotify_store.mark_digest_sent(telegram_user_id, date)
+            available_count = sum(1 for _, track, _ in station_tracks if track)
+            unavailable = [
+                station.key for station, track, _ in station_tracks if not track
+            ]
+            logger.info(
+                "RADIO CHECK | stations=%s/%s | users=%s | "
+                "matches=%s | sent=%s | %.1fs",
+                available_count,
+                len(STATIONS),
+                len(user_ids),
+                matches_found,
+                messages_sent,
+                time.monotonic() - cycle_started,
+            )
+            if unavailable:
+                logger.warning("RADIO NO DATA | %s", ", ".join(unavailable))
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Spotify notification monitor failed")
+            logger.exception("MONITOR ERROR")
         await asyncio.sleep(60)
 
 
@@ -555,6 +563,7 @@ async def spotify_callback(request: web.Request) -> web.Response:
         telegram_user_id,
         StoredSpotifyToken(token.access_token, token.refresh_token, token.expires_at),
     )
+    logger.info("SPOTIFY CONNECTED | user=%s", telegram_user_id)
     bot: Bot = request.app["bot"]
     await bot.send_message(
         telegram_user_id,
@@ -934,12 +943,15 @@ async def main() -> None:
         redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI", ""),
     )
     database_path = Path(os.getenv("DATABASE_PATH", "data/spotify.sqlite3"))
-    spotify_store = SpotifyStore(database_path)
-
-    logging.basicConfig(
-        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    log_dir = Path(os.getenv("LOG_DIR", "logs"))
+    configure_logging(log_dir, airplay_logger)
+    logger.info(
+        "START | database=%s | spotify=%s | port=%s",
+        database_path,
+        "configured" if spotify_config.is_configured else "disabled",
+        os.getenv("PORT", "local"),
     )
-    configure_airplay_logging(Path(os.getenv("LOG_DIR", "logs")))
+    spotify_store = SpotifyStore(database_path)
     timeout = aiohttp.ClientTimeout(total=15, connect=6, sock_read=10)
     async with aiohttp.ClientSession(
         timeout=timeout, headers={"User-Agent": "RadioNowTelegramBot/1.0"}
@@ -965,6 +977,12 @@ async def main() -> None:
             await callback_runner.setup()
             callback_site = web.TCPSite(callback_runner, server_host, server_port)
             await callback_site.start()
+            logger.info(
+                "HTTP READY | host=%s | port=%s | callback=%s",
+                server_host,
+                server_port,
+                redirect.path if spotify_config.is_configured else "disabled",
+            )
         await bot.set_my_commands(
             [
                 BotCommand(command="start", description="Открыть список станций"),
@@ -977,9 +995,12 @@ async def main() -> None:
         dispatcher = Dispatcher()
         dispatcher.include_router(router)
         notification_task = asyncio.create_task(spotify_notification_monitor(bot))
+        bot_info = await bot.get_me()
+        logger.info("BOT READY | @%s | id=%s", bot_info.username, bot_info.id)
         try:
             await dispatcher.start_polling(bot)
         finally:
+            logger.info("STOP | RadioBot is shutting down")
             notification_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await notification_task
