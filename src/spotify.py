@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import re
 import secrets
 import time
@@ -16,6 +17,7 @@ import aiohttp
 SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_SAVED_TRACKS_URL = "https://api.spotify.com/v1/me/tracks"
 SPOTIFY_SCOPES = "user-library-read"
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -46,6 +48,63 @@ class SpotifyError(RuntimeError):
     """Spotify could not return the user's saved tracks."""
 
 
+async def _raise_spotify_api_error(response: aiohttp.ClientResponse) -> None:
+    """Turn an unsuccessful Spotify API response into a useful safe error."""
+    if response.status < 400:
+        return
+    try:
+        payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, ValueError):
+        payload = {}
+    error = payload.get("error", {}) if isinstance(payload, dict) else {}
+    detail = error.get("message", "") if isinstance(error, dict) else ""
+    reason = error.get("reason", "") if isinstance(error, dict) else ""
+    logger.warning(
+        "SPOTIFY API ERROR | status=%s | reason=%s | detail=%s",
+        response.status,
+        reason or "unknown",
+        detail or "unknown",
+    )
+    if response.status == 401:
+        raise SpotifyError("Spotify authorization has expired")
+    if response.status == 403:
+        raise SpotifyError(
+            "Spotify denied access (403). Check Premium and the app allowlist"
+        )
+    if response.status == 429:
+        if reason == "QUOTA_EXCEEDED":
+            raise SpotifyError("Spotify API quota has been exceeded (429)")
+        raise SpotifyError("Too many requests to Spotify (429). Try again later")
+    if response.status >= 500:
+        raise SpotifyError(f"Spotify service error ({response.status})")
+    raise SpotifyError(f"Spotify rejected the request ({response.status})")
+
+
+async def _raise_spotify_token_error(response: aiohttp.ClientResponse) -> None:
+    """Describe OAuth token errors without logging credentials or tokens."""
+    if response.status < 400:
+        return
+    try:
+        payload = await response.json(content_type=None)
+    except (aiohttp.ClientError, ValueError):
+        payload = {}
+    code = str(payload.get("error", "")) if isinstance(payload, dict) else ""
+    logger.warning(
+        "SPOTIFY OAUTH ERROR | status=%s | code=%s",
+        response.status,
+        code or "unknown",
+    )
+    if code == "invalid_client":
+        raise SpotifyError("Spotify Client ID or Client Secret is invalid")
+    if code == "invalid_grant":
+        raise SpotifyError("Spotify authorization has expired; connect it again")
+    if response.status == 429:
+        raise SpotifyError("Too many authorization requests to Spotify (429)")
+    if response.status >= 500:
+        raise SpotifyError(f"Spotify authorization service error ({response.status})")
+    raise SpotifyError(f"Spotify rejected the authorization ({response.status})")
+
+
 async def fetch_recent_liked_tracks(
     session: aiohttp.ClientSession, access_token: str, limit: int = 10
 ) -> list[SpotifyTrack]:
@@ -56,11 +115,10 @@ async def fetch_recent_liked_tracks(
             params={"limit": limit, "offset": 0},
             headers={"Authorization": f"Bearer {access_token}"},
         ) as response:
-            if response.status == 401:
-                raise SpotifyError("Spotify authorization has expired")
-            response.raise_for_status()
+            await _raise_spotify_api_error(response)
             payload: dict[str, Any] = await response.json(content_type=None)
     except (aiohttp.ClientError, ValueError) as exc:
+        logger.warning("SPOTIFY API NETWORK ERROR | type=%s", type(exc).__name__)
         raise SpotifyError("Spotify is temporarily unavailable") from exc
 
     tracks: list[SpotifyTrack] = []
@@ -89,11 +147,10 @@ async def fetch_all_liked_tracks(
                 params={"limit": limit, "offset": offset},
                 headers={"Authorization": f"Bearer {access_token}"},
             ) as response:
-                if response.status == 401:
-                    raise SpotifyError("Spotify authorization has expired")
-                response.raise_for_status()
+                await _raise_spotify_api_error(response)
                 payload: dict[str, Any] = await response.json(content_type=None)
         except (aiohttp.ClientError, ValueError) as exc:
+            logger.warning("SPOTIFY API NETWORK ERROR | type=%s", type(exc).__name__)
             raise SpotifyError("Spotify is temporarily unavailable") from exc
 
         items = payload.get("items", [])
@@ -175,10 +232,10 @@ async def _request_token(
             data=data,
             auth=aiohttp.BasicAuth(config.client_id, config.client_secret),
         ) as response:
-            if response.status >= 400:
-                raise SpotifyError("Spotify rejected the authorization request")
+            await _raise_spotify_token_error(response)
             return await response.json(content_type=None)
     except (aiohttp.ClientError, ValueError) as exc:
+        logger.warning("SPOTIFY OAUTH NETWORK ERROR | type=%s", type(exc).__name__)
         raise SpotifyError("Spotify authorization is temporarily unavailable") from exc
 
 

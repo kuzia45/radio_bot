@@ -3,6 +3,7 @@ from unittest.mock import patch
 
 from src.spotify import (
     SpotifyConfig,
+    SpotifyError,
     build_authorization_url,
     fetch_all_liked_tracks,
     fetch_recent_liked_tracks,
@@ -40,6 +41,23 @@ class FakeResponse:
 class FakeSession:
     def get(self, *_: object, **__: object) -> FakeResponse:
         return FakeResponse()
+
+
+class ErrorResponse(FakeResponse):
+    def __init__(self, status: int, payload: dict) -> None:
+        self.status = status
+        self.payload = payload
+
+    async def json(self, **_: object) -> dict:
+        return self.payload
+
+
+class ErrorSession:
+    def __init__(self, response: ErrorResponse) -> None:
+        self.response = response
+
+    def get(self, *_: object, **__: object) -> ErrorResponse:
+        return self.response
 
 
 class SpotifyPreparationTests(unittest.TestCase):
@@ -92,6 +110,26 @@ class SpotifyApiTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             [(track.artist, track.title) for track in tracks], [("Muse", "Uprising")]
         )
+
+    async def test_forbidden_error_explains_premium_and_allowlist(self) -> None:
+        session = ErrorSession(ErrorResponse(403, {"error": {"message": "Forbidden"}}))
+        with self.assertRaisesRegex(SpotifyError, "Premium.*allowlist"):
+            await fetch_recent_liked_tracks(session, "token")  # type: ignore[arg-type]
+
+    async def test_quota_error_is_reported_separately(self) -> None:
+        session = ErrorSession(
+            ErrorResponse(
+                429,
+                {
+                    "error": {
+                        "message": "Too many requests",
+                        "reason": "QUOTA_EXCEEDED",
+                    }
+                },
+            )
+        )
+        with self.assertRaisesRegex(SpotifyError, "quota.*429"):
+            await fetch_recent_liked_tracks(session, "token")  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
