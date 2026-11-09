@@ -8,10 +8,10 @@ import html
 import logging
 import os
 import time
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote_plus, urlparse
 
 import aiohttp
 from aiogram import Bot, Dispatcher, F, Router
@@ -43,7 +43,12 @@ from src.spotify import (
     refresh_access_token,
     tracks_match,
 )
-from src.spotify_store import SpotifyStore, StoredSpotifyToken
+from src.spotify_store import SpotifyStore, StoredSpotifyToken, StoredYandexToken
+from src.yandex_integration import (
+    YandexMusicError,
+    authorize_yandex_music,
+    fetch_yandex_liked_tracks,
+)
 
 router = Router()
 logger = logging.getLogger(__name__)
@@ -52,6 +57,8 @@ radio_service: RadioService | None = None
 spotify_config: SpotifyConfig | None = None
 spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
+MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
+ALL_STATION_KEYS = {station.key for station in STATIONS}
 
 
 def configure_airplay_logging(log_dir: Path = Path("logs")) -> None:
@@ -117,13 +124,44 @@ def stations_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def result_keyboard(station: Station) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def music_links(track: str) -> list[InlineKeyboardButton]:
+    query = quote_plus(track)
+    return [
+        InlineKeyboardButton(
+            text="Spotify", url=f"https://open.spotify.com/search/{query}"
+        ),
+        InlineKeyboardButton(
+            text="Яндекс Музыка", url=f"https://music.yandex.ru/search?text={query}"
+        ),
+        InlineKeyboardButton(
+            text="YouTube", url=f"https://www.youtube.com/results?search_query={query}"
+        ),
+    ]
+
+
+def result_keyboard(
+    station: Station, telegram_user_id: int, track: str | None = None
+) -> InlineKeyboardMarkup:
+    assert spotify_store is not None
+    is_favorite = station.key in spotify_store.favorite_station_keys(telegram_user_id)
+    rows = []
+    if track:
+        rows.append(music_links(track))
+    rows.extend(
+        [
             [
                 InlineKeyboardButton(
                     text="🔄 Обновить", callback_data=f"station:{station.key}"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="🕘 Последние 10", callback_data=f"history:{station.key}"
+                ),
+                InlineKeyboardButton(
+                    text="⭐ Убрать" if is_favorite else "☆ В избранное",
+                    callback_data=f"favorite:{station.key}",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -132,6 +170,7 @@ def result_keyboard(station: Station) -> InlineKeyboardMarkup:
             ],
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def start_keyboard() -> ReplyKeyboardMarkup:
@@ -139,12 +178,21 @@ def start_keyboard() -> ReplyKeyboardMarkup:
         keyboard=[
             [
                 KeyboardButton(text="🟢 Подключить Spotify"),
-                KeyboardButton(text="💚 Последние лайки"),
+                KeyboardButton(text="🟡 Подключить Яндекс Музыку"),
+            ],
+            [
+                KeyboardButton(text="💚 Лайки Spotify"),
+                KeyboardButton(text="💛 Лайки Яндекс"),
             ],
             [
                 KeyboardButton(text="📻 Старт"),
                 KeyboardButton(text="📋 Все станции"),
             ],
+            [
+                KeyboardButton(text="⭐ Мои станции"),
+                KeyboardButton(text="⚙️ Уведомления"),
+            ],
+            [KeyboardButton(text="📊 Итоги дня")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -194,6 +242,7 @@ async def spotify_status(message: Message) -> None:
 
 
 @router.message(Command("liked"))
+@router.message(F.text == "💚 Лайки Spotify")
 @router.message(F.text == "💚 Последние лайки")
 async def recent_liked_tracks(message: Message) -> None:
     telegram_user_id = message.from_user.id if message.from_user else message.chat.id
@@ -223,6 +272,69 @@ async def recent_liked_tracks(message: Message) -> None:
         for index, track in enumerate(tracks, start=1)
     ]
     await message.answer("💚 <b>Последние лайки Spotify</b>\n\n" + "\n".join(lines))
+
+
+@router.message(Command("yandex"))
+@router.message(F.text == "🟡 Подключить Яндекс Музыку")
+async def connect_yandex_music(message: Message) -> None:
+    assert spotify_store is not None
+    telegram_user_id = message.from_user.id if message.from_user else message.chat.id
+
+    async def show_code(code) -> None:
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Открыть Яндекс", url=code.verification_url)]
+            ]
+        )
+        await message.answer(
+            "🟡 <b>Подключение Яндекс Музыки</b>\n\n"
+            f"Откройте страницу Яндекса и введите код:\n"
+            f"<code>{html.escape(code.user_code)}</code>\n\n"
+            f"Код действует {code.expires_in // 60} мин. Пароль вводится только на стороне Яндекса.",
+            reply_markup=keyboard,
+        )
+
+    try:
+        access_token, refresh_token, expires_in = await authorize_yandex_music(
+            show_code
+        )
+    except YandexMusicError as exc:
+        await message.answer(f"⚠️ {html.escape(str(exc))}. Попробуйте ещё раз.")
+        return
+    expires_at = int(time.time()) + expires_in if expires_in else None
+    spotify_store.save_yandex_token(
+        telegram_user_id,
+        StoredYandexToken(access_token, refresh_token, expires_at),
+    )
+    await message.answer(
+        "✅ Яндекс Музыка подключена. Лайки будут участвовать в уведомлениях.",
+        reply_markup=start_keyboard(),
+    )
+
+
+@router.message(F.text == "💛 Лайки Яндекс")
+async def recent_yandex_liked_tracks(message: Message) -> None:
+    assert spotify_store is not None
+    telegram_user_id = message.from_user.id if message.from_user else message.chat.id
+    token = spotify_store.get_yandex_token(telegram_user_id)
+    if token is None:
+        await message.answer("Сначала нажмите «🟡 Подключить Яндекс Музыку».")
+        return
+    try:
+        tracks = await fetch_yandex_liked_tracks(token.access_token, limit=10)
+    except YandexMusicError as exc:
+        await message.answer(f"⚠️ {html.escape(str(exc))}. Подключите Яндекс заново.")
+        return
+    if not tracks:
+        await message.answer("В Яндекс Музыке пока нет понравившихся треков.")
+        return
+    lines = [
+        f"{index}. <b>{html.escape(track.artist)}</b> — {html.escape(track.title)}"
+        for index, track in enumerate(tracks, start=1)
+    ]
+    await message.answer(
+        "💛 <b>Последние лайки Яндекс Музыки</b>\n\n" + "\n".join(lines)
+    )
 
 
 @router.message(F.text.contains("/spotify/callback"))
@@ -297,17 +409,20 @@ async def get_spotify_access_token(telegram_user_id: int) -> str | None:
 
 async def spotify_notification_monitor(bot: Bot) -> None:
     """Notify connected users when a liked track appears on any station."""
-    liked_cache: dict[int, tuple[float, list]] = {}
+    liked_cache: dict[tuple[str, int], tuple[float, list]] = {}
     airplay_state: dict[str, tuple[str, float]] = {}
     semaphore = asyncio.Semaphore(3)
 
-    async def read_station(station: Station) -> tuple[Station, str | None]:
+    async def read_station(
+        station: Station,
+    ) -> tuple[Station, str | None, str | None]:
         async with semaphore:
             try:
                 assert radio_service is not None
-                return station, await radio_service.now_playing(station)
-            except RadioError:
-                return station, None
+                track = await radio_service.now_playing(station)
+                return station, track, None if track else "Нет данных"
+            except RadioError as exc:
+                return station, None, str(exc)
 
     while True:
         try:
@@ -316,33 +431,62 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                 *(read_station(station) for station in STATIONS)
             )
             checked_at = time.monotonic()
-            for station, radio_track in station_tracks:
+            for station, radio_track, error in station_tracks:
+                spotify_store.update_station_status(station.key, radio_track, error)
                 if radio_track and should_log_airplay(
                     airplay_state, station.key, radio_track, checked_at
                 ):
                     airplay_logger.info("%s — %s", station.title, radio_track)
+                    spotify_store.record_airplay(station.key, radio_track)
 
-            for telegram_user_id in spotify_store.connected_user_ids():
+            for telegram_user_id in spotify_store.music_user_ids():
+                liked_tracks = []
                 access_token = await get_spotify_access_token(telegram_user_id)
-                if not access_token:
-                    continue
-                cached = liked_cache.get(telegram_user_id)
-                if cached and cached[0] > time.monotonic():
-                    liked_tracks = cached[1]
-                else:
-                    try:
-                        liked_tracks = await fetch_all_liked_tracks(
-                            radio_service.session, access_token
+                if access_token:
+                    cache_key = ("spotify", telegram_user_id)
+                    cached = liked_cache.get(cache_key)
+                    if cached and cached[0] > time.monotonic():
+                        liked_tracks.extend(cached[1])
+                    else:
+                        try:
+                            spotify_tracks = await fetch_all_liked_tracks(
+                                radio_service.session, access_token
+                            )
+                        except SpotifyError:
+                            spotify_tracks = []
+                        liked_cache[cache_key] = (
+                            time.monotonic() + 10 * 60,
+                            spotify_tracks,
                         )
-                    except SpotifyError:
-                        continue
-                    liked_cache[telegram_user_id] = (
-                        time.monotonic() + 10 * 60,
-                        liked_tracks,
-                    )
+                        liked_tracks.extend(spotify_tracks)
 
-                for station, radio_track in station_tracks:
-                    if not radio_track:
+                yandex_token = spotify_store.get_yandex_token(telegram_user_id)
+                if yandex_token:
+                    cache_key = ("yandex", telegram_user_id)
+                    cached = liked_cache.get(cache_key)
+                    if cached and cached[0] > time.monotonic():
+                        liked_tracks.extend(cached[1])
+                    else:
+                        try:
+                            yandex_tracks = await fetch_yandex_liked_tracks(
+                                yandex_token.access_token
+                            )
+                        except YandexMusicError:
+                            yandex_tracks = []
+                        liked_cache[cache_key] = (
+                            time.monotonic() + 10 * 60,
+                            yandex_tracks,
+                        )
+                        liked_tracks.extend(yandex_tracks)
+
+                if not liked_tracks:
+                    continue
+
+                selected_stations = spotify_store.notification_station_keys(
+                    telegram_user_id, ALL_STATION_KEYS
+                )
+                for station, radio_track, _ in station_tracks:
+                    if not radio_track or station.key not in selected_stations:
                         continue
                     matched = any(
                         tracks_match(radio_track, track.artist, track.title)
@@ -352,12 +496,34 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                         telegram_user_id, station.key, radio_track
                     ):
                         continue
-                    await bot.send_message(
-                        telegram_user_id,
-                        f"💚 <b>{html.escape(station.title)}</b>\n\n"
-                        "Сейчас играет трек из ваших любимых:\n"
-                        f"🎵 <b>{html.escape(radio_track)}</b>",
+                    quiet = is_quiet_time(
+                        datetime.now(MOSCOW_TZ).hour,
+                        spotify_store.quiet_hours(telegram_user_id),
                     )
+                    spotify_store.record_match(
+                        telegram_user_id,
+                        station.key,
+                        radio_track,
+                        delivered=not quiet,
+                    )
+                    if not quiet:
+                        await bot.send_message(
+                            telegram_user_id,
+                            f"💚 <b>{html.escape(station.title)}</b>\n\n"
+                            "Сейчас играет трек из ваших любимых:\n"
+                            f"🎵 <b>{html.escape(radio_track)}</b>",
+                            reply_markup=InlineKeyboardMarkup(
+                                inline_keyboard=[music_links(radio_track)]
+                            ),
+                        )
+
+                now = datetime.now(MOSCOW_TZ)
+                date = now.date().isoformat()
+                if spotify_store.digest_due(telegram_user_id, date, now.hour):
+                    await bot.send_message(
+                        telegram_user_id, build_daily_digest(telegram_user_id, date)
+                    )
+                    spotify_store.mark_digest_sent(telegram_user_id, date)
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -420,7 +586,7 @@ async def build_summary() -> str:
             return f"🎵 <b>{html.escape(station.title)}</b> — {html.escape(title)}"
 
     lines = await asyncio.gather(*(check(station) for station in STATIONS))
-    checked_at = datetime.now().astimezone().strftime("%H:%M:%S")
+    checked_at = datetime.now(MOSCOW_TZ).strftime("%H:%M:%S")
     return (
         "📋 <b>Сейчас в эфире</b>\n\n"
         + "\n".join(lines)
@@ -441,11 +607,241 @@ def summary_keyboard() -> InlineKeyboardMarkup:
     )
 
 
+def is_quiet_time(hour: int, quiet_hours: tuple[int, int] | None) -> bool:
+    if quiet_hours is None:
+        return False
+    start, end = quiet_hours
+    if start < end:
+        return start <= hour < end
+    return hour >= start or hour < end
+
+
+def build_daily_digest(telegram_user_id: int, date: str | None = None) -> str:
+    assert spotify_store is not None
+    date = date or datetime.now(MOSCOW_TZ).date().isoformat()
+    matches = spotify_store.daily_matches(telegram_user_id, date)
+    if not matches:
+        return "📊 <b>Итоги дня</b>\n\nСегодня совпадений с любимыми треками не было."
+    by_station: dict[str, int] = {}
+    for station_key, _, _, _ in matches:
+        by_station[station_key] = by_station.get(station_key, 0) + 1
+    station_lines = [
+        f"• {html.escape(STATIONS_BY_KEY[key].title)} — {count}"
+        for key, count in sorted(by_station.items(), key=lambda item: -item[1])
+        if key in STATIONS_BY_KEY
+    ]
+    recent = [
+        f"• {html.escape(STATIONS_BY_KEY[key].title)}: {html.escape(track)}"
+        for key, track, _, _ in matches[-5:]
+        if key in STATIONS_BY_KEY
+    ]
+    return (
+        f"📊 <b>Итоги дня</b>\n\nСовпадений: <b>{len(matches)}</b>\n\n"
+        + "<b>По станциям:</b>\n"
+        + "\n".join(station_lines)
+        + "\n\n<b>Последние:</b>\n"
+        + "\n".join(recent)
+    )
+
+
 @router.message(Command("summary"))
 @router.message(F.text == "📋 Все станции")
 async def summary_message(message: Message) -> None:
     status = await message.answer("⏳ Собираю данные со всех станций…")
     await status.edit_text(await build_summary(), reply_markup=summary_keyboard())
+
+
+@router.message(F.text == "📊 Итоги дня")
+async def daily_digest_message(message: Message) -> None:
+    telegram_user_id = message.from_user.id if message.from_user else message.chat.id
+    await message.answer(build_daily_digest(telegram_user_id))
+
+
+def notification_settings_keyboard(telegram_user_id: int) -> InlineKeyboardMarkup:
+    assert spotify_store is not None
+    selected = spotify_store.notification_station_keys(
+        telegram_user_id, ALL_STATION_KEYS
+    )
+    rows = []
+    for index in range(0, len(STATIONS), 2):
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if station.key in selected else "⬜ ") + station.title,
+                    callback_data=f"notify:{station.key}",
+                )
+                for station in STATIONS[index : index + 2]
+            ]
+        )
+    quiet = spotify_store.quiet_hours(telegram_user_id)
+    rows.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if quiet is None else "") + "Без тихих часов",
+                    callback_data="quiet:off",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text=("✅ " if quiet == (23, 8) else "") + "23:00–08:00",
+                    callback_data="quiet:23-8",
+                ),
+                InlineKeyboardButton(
+                    text=("✅ " if quiet == (22, 9) else "") + "22:00–09:00",
+                    callback_data="quiet:22-9",
+                ),
+            ],
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+@router.message(Command("settings"))
+@router.message(F.text == "⚙️ Уведомления")
+async def notification_settings(message: Message) -> None:
+    telegram_user_id = message.from_user.id if message.from_user else message.chat.id
+    await message.answer(
+        "⚙️ <b>Уведомления</b>\n\n"
+        "Выберите станции и при необходимости включите тихие часы. "
+        "Ежедневная сводка приходит в 20:00 по Москве.",
+        reply_markup=notification_settings_keyboard(telegram_user_id),
+    )
+
+
+@router.callback_query(F.data.startswith("notify:"))
+async def toggle_notification_station(callback: CallbackQuery) -> None:
+    assert spotify_store is not None
+    station_key = (callback.data or "").partition(":")[2]
+    if station_key not in STATIONS_BY_KEY:
+        await callback.answer("Станция не найдена", show_alert=True)
+        return
+    enabled = spotify_store.toggle_notification_station(
+        callback.from_user.id, station_key, ALL_STATION_KEYS
+    )
+    await callback.answer("Включено" if enabled else "Выключено")
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=notification_settings_keyboard(callback.from_user.id)
+        )
+
+
+@router.callback_query(F.data.startswith("quiet:"))
+async def set_quiet_hours(callback: CallbackQuery) -> None:
+    assert spotify_store is not None
+    value = (callback.data or "quiet:off").partition(":")[2]
+    hours = None if value == "off" else tuple(map(int, value.split("-")))
+    spotify_store.set_quiet_hours(callback.from_user.id, hours)
+    await callback.answer("Тихие часы обновлены")
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=notification_settings_keyboard(callback.from_user.id)
+        )
+
+
+@router.message(F.text == "⭐ Мои станции")
+async def favorite_stations(message: Message) -> None:
+    assert spotify_store is not None
+    telegram_user_id = message.from_user.id if message.from_user else message.chat.id
+    favorite_keys = spotify_store.favorite_station_keys(telegram_user_id)
+    stations = [station for station in STATIONS if station.key in favorite_keys]
+    if not stations:
+        await message.answer(
+            "⭐ Избранных станций пока нет. Откройте станцию и нажмите «В избранное»."
+        )
+        return
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=station.title, callback_data=f"station:{station.key}"
+                )
+            ]
+            for station in stations
+        ]
+    )
+    await message.answer("⭐ <b>Мои станции</b>", reply_markup=keyboard)
+
+
+@router.callback_query(F.data.startswith("favorite:"))
+async def toggle_favorite_station(callback: CallbackQuery) -> None:
+    assert spotify_store is not None
+    station_key = (callback.data or "").partition(":")[2]
+    station = STATIONS_BY_KEY.get(station_key)
+    if station is None:
+        return
+    added = spotify_store.toggle_favorite(callback.from_user.id, station_key)
+    await callback.answer("Добавлено в избранное" if added else "Удалено из избранного")
+    if callback.message:
+        await callback.message.edit_reply_markup(
+            reply_markup=result_keyboard(station, callback.from_user.id)
+        )
+
+
+@router.callback_query(F.data.startswith("history:"))
+async def station_history(callback: CallbackQuery) -> None:
+    assert spotify_store is not None
+    station_key = (callback.data or "").partition(":")[2]
+    station = STATIONS_BY_KEY.get(station_key)
+    if station is None or callback.message is None:
+        return
+    history = spotify_store.recent_airplay(station_key)
+    if not history:
+        text = "История ещё не накопилась. Вернитесь через несколько минут."
+    else:
+        lines = []
+        for index, (track, played_at) in enumerate(history, start=1):
+            played_time = datetime.fromisoformat(played_at).astimezone(MOSCOW_TZ)
+            lines.append(f"{index}. {played_time:%H:%M} — {html.escape(track)}")
+        text = "\n".join(lines)
+    await callback.answer()
+    await callback.message.edit_text(
+        f"🕘 <b>{html.escape(station.title)}: последние треки</b>\n\n{text}",
+        reply_markup=result_keyboard(station, callback.from_user.id),
+    )
+
+
+@router.message(Command("admin_sources"))
+async def admin_source_status(message: Message) -> None:
+    admin_user_id = int(os.getenv("ADMIN_USER_ID", "0") or 0)
+    sender_id = message.from_user.id if message.from_user else 0
+    if not admin_user_id or sender_id != admin_user_id:
+        return
+    assert spotify_store is not None
+    statuses = {row[0]: row for row in spotify_store.station_statuses()}
+    now = datetime.now(MOSCOW_TZ)
+    lines = ["🛠 <b>Состояние источников</b>"]
+    for station in STATIONS:
+        row = statuses.get(station.key)
+        if not row:
+            lines.append(f"⚪ {station.title} — ещё не проверялась")
+            continue
+        _, track, _success_at, change_at, failures, error = row
+        stale_minutes = None
+        if change_at:
+            changed = datetime.fromisoformat(change_at).astimezone(MOSCOW_TZ)
+            stale_minutes = int((now - changed).total_seconds() // 60)
+        icon = (
+            "🔴" if failures else "🟡" if stale_minutes and stale_minutes > 30 else "🟢"
+        )
+        detail = (
+            f"ошибок подряд: {failures}"
+            if failures
+            else f"без смены: {stale_minutes or 0} мин"
+        )
+        lines.append(f"{icon} {station.title} — {detail}")
+        if error and failures:
+            lines.append(f"   {html.escape(str(error))}")
+        elif track:
+            lines.append(f"   {html.escape(str(track))}")
+    await message.answer("\n".join(lines))
+
+
+@router.message(Command("id"))
+async def show_user_id(message: Message) -> None:
+    """Show the Telegram ID needed for administrator configuration."""
+    sender_id = message.from_user.id if message.from_user else message.chat.id
+    await message.answer(f"Ваш Telegram ID: <code>{sender_id}</code>")
 
 
 @router.callback_query(F.data == "summary")
@@ -492,23 +888,28 @@ async def show_track(callback: CallbackQuery) -> None:
     if station is None or callback.message is None:
         return
 
-    assert radio_service is not None
+    assert radio_service is not None and spotify_store is not None
+    title: str | None = None
     try:
         title = await radio_service.now_playing(station)
         if title:
+            spotify_store.record_airplay(station.key, title)
+            spotify_store.update_station_status(station.key, title)
             body = f"🎙 <b>{html.escape(station.title)}</b>\n\nСейчас играет:\n🎵 <b>{html.escape(title)}</b>"
         else:
+            spotify_store.update_station_status(station.key, None, "Нет данных")
             body = (
                 f"🎙 <b>{html.escape(station.title)}</b>\n\n"
                 "Станция сейчас не передаёт название трека в эфирном потоке."
             )
     except RadioError as exc:
+        spotify_store.update_station_status(station.key, None, str(exc))
         body = f"🎙 <b>{html.escape(station.title)}</b>\n\n⚠️ {html.escape(str(exc))}. Попробуйте ещё раз."
 
-    checked_at = datetime.now().astimezone().strftime("%H:%M:%S")
+    checked_at = datetime.now(MOSCOW_TZ).strftime("%H:%M:%S")
     await callback.message.edit_text(
         f"{body}\n\n<i>Проверено в {checked_at}</i>",
-        reply_markup=result_keyboard(station),
+        reply_markup=result_keyboard(station, callback.from_user.id, title),
     )
 
 
@@ -568,6 +969,8 @@ async def main() -> None:
             [
                 BotCommand(command="start", description="Открыть список станций"),
                 BotCommand(command="summary", description="Сводка по всем станциям"),
+                BotCommand(command="settings", description="Настроить уведомления"),
+                BotCommand(command="id", description="Показать мой Telegram ID"),
             ]
         )
         await bot.set_chat_menu_button(menu_button=MenuButtonCommands())
