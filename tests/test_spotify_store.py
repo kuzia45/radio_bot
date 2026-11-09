@@ -30,6 +30,14 @@ class SpotifyStoreTests(unittest.TestCase):
         self.assertTrue(self.store.mark_notification(42, "maximum", "Muse - Uprising"))
         self.assertFalse(self.store.mark_notification(42, "maximum", "Muse - Uprising"))
         self.assertTrue(self.store.mark_notification(42, "maximum", "Muse - Starlight"))
+        row = self.store.connection.execute(
+            "SELECT radio_track, notified_at FROM spotify_notifications "
+            "WHERE telegram_user_id = 42 AND station_key = 'maximum'"
+        ).fetchone()
+        self.assertEqual(row[0], "Muse - Starlight")
+        self.assertRegex(
+            row[1], r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$"
+        )
 
 
 if __name__ == "__main__":

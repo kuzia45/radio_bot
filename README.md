@@ -107,3 +107,29 @@ Copy-Item .env.example .env
 .venv\Scripts\ruff.exe format .
 .venv\Scripts\ruff.exe check .
 ```
+
+## Размещение на Railway
+
+Проект готов к запуску из Docker-контейнера. После публикации компьютер можно
+выключать: бот будет работать на сервере Railway.
+
+1. Создайте в Railway проект из этого GitHub-репозитория.
+2. Добавьте к сервису Volume и смонтируйте его в `/app/storage`.
+3. Добавьте переменные окружения:
+
+   ```text
+   BOT_TOKEN=...
+   SPOTIFY_CLIENT_ID=...
+   SPOTIFY_CLIENT_SECRET=...
+   SPOTIFY_REDIRECT_URI=https://<домен-railway>/spotify/callback
+   DATABASE_PATH=/app/storage/spotify.sqlite3
+   LOG_DIR=/app/storage/logs
+   ```
+
+4. В разделе Networking создайте публичный домен Railway.
+5. В настройках приложения Spotify добавьте тот же адрес
+   `https://<домен-railway>/spotify/callback` в список Redirect URIs.
+6. Перезапустите Deployment после сохранения переменных.
+
+Railway сам задаёт `PORT`, проверяет `/health` и перезапускает процесс после
+сбоя. Токен Telegram и секрет Spotify нельзя записывать в репозиторий.

@@ -5,6 +5,7 @@ from __future__ import annotations
 import sqlite3
 import time
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
@@ -44,10 +45,21 @@ class SpotifyStore:
                 telegram_user_id INTEGER NOT NULL,
                 station_key TEXT NOT NULL,
                 radio_track TEXT NOT NULL,
+                notified_at TEXT NOT NULL,
                 PRIMARY KEY (telegram_user_id, station_key)
             )
             """
         )
+        notification_columns = {
+            row[1]
+            for row in self.connection.execute(
+                "PRAGMA table_info(spotify_notifications)"
+            ).fetchall()
+        }
+        if "notified_at" not in notification_columns:
+            self.connection.execute(
+                "ALTER TABLE spotify_notifications ADD COLUMN notified_at TEXT"
+            )
         self.connection.commit()
 
     def save_state(self, state: str, telegram_user_id: int) -> None:
@@ -109,8 +121,15 @@ class SpotifyStore:
         if row and row[0] == radio_track:
             return False
         self.connection.execute(
-            "INSERT OR REPLACE INTO spotify_notifications VALUES (?, ?, ?)",
-            (telegram_user_id, station_key, radio_track),
+            "INSERT OR REPLACE INTO spotify_notifications "
+            "(telegram_user_id, station_key, radio_track, notified_at) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                telegram_user_id,
+                station_key,
+                radio_track,
+                datetime.now().astimezone().isoformat(timespec="seconds"),
+            ),
         )
         self.connection.commit()
         return True

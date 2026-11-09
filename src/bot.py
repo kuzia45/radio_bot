@@ -54,11 +54,11 @@ spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
 
 
-def configure_airplay_logging() -> None:
+def configure_airplay_logging(log_dir: Path = Path("logs")) -> None:
     """Write radio history to a bounded, dedicated UTF-8 log file."""
-    Path("logs").mkdir(exist_ok=True)
+    log_dir.mkdir(parents=True, exist_ok=True)
     handler = RotatingFileHandler(
-        "logs/airplay.log",
+        log_dir / "airplay.log",
         maxBytes=5 * 1024 * 1024,
         backupCount=3,
         encoding="utf-8",
@@ -400,6 +400,11 @@ async def spotify_callback(request: web.Request) -> web.Response:
     )
 
 
+async def health_check(_: web.Request) -> web.Response:
+    """Confirm to the hosting platform that the bot process is alive."""
+    return web.Response(text="OK")
+
+
 async def build_summary() -> str:
     assert radio_service is not None
     semaphore = asyncio.Semaphore(3)
@@ -527,12 +532,13 @@ async def main() -> None:
         client_secret=os.getenv("SPOTIFY_CLIENT_SECRET", ""),
         redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI", ""),
     )
-    spotify_store = SpotifyStore(Path("data/spotify.sqlite3"))
+    database_path = Path(os.getenv("DATABASE_PATH", "data/spotify.sqlite3"))
+    spotify_store = SpotifyStore(database_path)
 
     logging.basicConfig(
         level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
     )
-    configure_airplay_logging()
+    configure_airplay_logging(Path(os.getenv("LOG_DIR", "logs")))
     timeout = aiohttp.ClientTimeout(total=15, connect=6, sock_read=10)
     async with aiohttp.ClientSession(
         timeout=timeout, headers={"User-Agent": "RadioNowTelegramBot/1.0"}
@@ -540,20 +546,23 @@ async def main() -> None:
         radio_service = RadioService(session)
         bot = Bot(token=token, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
         callback_runner: web.AppRunner | None = None
-        if spotify_config.is_configured:
+        railway_port = os.getenv("PORT")
+        if spotify_config.is_configured or railway_port:
             redirect = urlparse(spotify_config.redirect_uri)
-            if redirect.hostname not in {"127.0.0.1", "::1"} or not redirect.port:
-                raise SystemExit(
-                    "SPOTIFY_REDIRECT_URI must use a local IP and an explicit port"
-                )
+            is_local = redirect.hostname in {"127.0.0.1", "::1"}
+            server_host = os.getenv(
+                "HOST", redirect.hostname if is_local else "0.0.0.0"
+            )
+            server_port = int(railway_port or redirect.port or 8080)
             callback_app = web.Application()
             callback_app["bot"] = bot
-            callback_app.router.add_get(redirect.path, spotify_callback)
+            callback_app.router.add_get("/health", health_check)
+            if spotify_config.is_configured:
+                callback_path = redirect.path or "/spotify/callback"
+                callback_app.router.add_get(callback_path, spotify_callback)
             callback_runner = web.AppRunner(callback_app)
             await callback_runner.setup()
-            callback_site = web.TCPSite(
-                callback_runner, redirect.hostname, redirect.port
-            )
+            callback_site = web.TCPSite(callback_runner, server_host, server_port)
             await callback_site.start()
         await bot.set_my_commands(
             [

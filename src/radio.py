@@ -68,8 +68,8 @@ STATIONS: tuple[Station, ...] = (
         "Лав Радио",
         "Love Radio",
         ("love radio", "лав радио"),
-        "https://www.loveradio.ru/",
-        "love",
+        "https://onlineradiobox.com/kz/loveradio/playlist/?lang=ru",
+        "online_radio_box",
     ),
     Station(
         "europa",
@@ -166,15 +166,16 @@ def parse_official_page(page: str, parser: str, slug: str | None = None) -> str 
         if artist and title:
             return f"{html.unescape(artist.group(1))} - {html.unescape(title.group(1))}"
 
-    if parser == "love":
-        artist = re.search(
-            r'class="player-track__artist"[^>]*>\s*(.*?)\s*</p>', page, re.DOTALL
+    if parser == "online_radio_box":
+        current = re.search(
+            r'<tr\s+class="active".*?class="track_history_item"[^>]*>\s*'
+            r"<a[^>]*>(.*?)</a>",
+            page,
+            re.DOTALL,
         )
-        title = re.search(
-            r'class="player-track__name"[^>]*>\s*(.*?)\s*</p>', page, re.DOTALL
-        )
-        if artist and title:
-            return f"{html.unescape(artist.group(1)).strip()} - {html.unescape(title.group(1)).strip()}"
+        if current:
+            title = re.sub(r"<[^>]+>", "", current.group(1))
+            return re.sub(r"\s+", " ", html.unescape(title)).strip() or None
 
     if parser == "energy":
         latest = re.search(r"Обложка трека '([^']+) - ([^']+)'", page)

@@ -31,9 +31,16 @@ class ParseIcyMetadataTests(unittest.TestCase):
             parse_official_page(page, "station_json", "maximum"), "Muse - Uprising"
         )
 
-    def test_love_page(self) -> None:
-        page = '<p class="player-track__artist">A &amp; B</p><p class="player-track__name">Song</p>'
-        self.assertEqual(parse_official_page(page, "love"), "A & B - Song")
+    def test_online_radio_box_page(self) -> None:
+        page = """
+        <tr class="active">
+          <td class="tablelist-schedule__time">сейчас</td>
+          <td class="track_history_item">
+            <a href="/track/1/">A &amp; B - Song</a>
+          </td>
+        </tr>
+        """
+        self.assertEqual(parse_official_page(page, "online_radio_box"), "A & B - Song")
 
     def test_energy_page(self) -> None:
         page = "Image: Обложка трека 'Song - Artist'"
