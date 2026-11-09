@@ -71,6 +71,7 @@ class SpotifyPreparationTests(unittest.TestCase):
         url = build_authorization_url(config, 42)
         self.assertIn("client_id=client+id", url)
         self.assertIn("scope=user-library-read", url)
+        self.assertIn("user-library-modify", url)
         self.assertIn("state=42%3Anonce", url)
 
     def test_normalization_handles_common_radio_variants(self) -> None:

@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import csv
 import html
+import io
 import logging
 import os
 import time
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import parse_qs, quote_plus, urlparse
@@ -20,6 +23,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
+    BufferedInputFile,
     CallbackQuery,
     CopyTextButton,
     InlineKeyboardButton,
@@ -41,7 +45,9 @@ from src.spotify import (
     create_authorization_url,
     exchange_authorization_code,
     fetch_all_liked_tracks,
+    normalize_track,
     refresh_access_token,
+    save_track_to_spotify,
     tracks_match,
 )
 from src.spotify_store import SpotifyStore, StoredSpotifyToken, StoredYandexToken
@@ -49,6 +55,7 @@ from src.yandex_integration import (
     YandexMusicError,
     authorize_yandex_music,
     fetch_yandex_liked_tracks,
+    save_track_to_yandex,
 )
 
 router = Router()
@@ -60,6 +67,10 @@ spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
 MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 ALL_STATION_KEYS = {station.key for station in STATIONS}
+APP_VERSION = os.getenv("APP_VERSION", "2026.11.1")
+STARTED_AT = datetime.now(MOSCOW_TZ)
+DATABASE_PATH = Path("data/spotify.sqlite3")
+BACKUP_DIR = Path("data/backups")
 
 
 def should_log_airplay(
@@ -83,6 +94,37 @@ def positive_env_int(name: str, default: int) -> int:
     except ValueError:
         logger.warning("INVALID SETTING | %s | using=%s", name, default)
         return default
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id == int(os.getenv("ADMIN_USER_ID", "0") or 0)
+
+
+def airplay_statistics(days: int = 7) -> str:
+    assert spotify_store is not None
+    rows = spotify_store.airplay_rows(days)
+    tracks = Counter(str(row[1]) for row in rows)
+    stations = Counter(str(row[0]) for row in rows)
+    artists = Counter(
+        str(row[1]).partition(" - ")[0] for row in rows if " - " in str(row[1])
+    )
+
+    def top(counter: Counter, limit: int = 5) -> str:
+        return (
+            "\n".join(
+                f"• {html.escape(name)} — {count}"
+                for name, count in counter.most_common(limit)
+            )
+            or "• данных пока нет"
+        )
+
+    return (
+        f"📊 <b>Статистика эфира за {days} дней</b>\n\n"
+        f"Записей: {len(rows)}\nУникальных треков: {len(tracks)}\n\n"
+        f"<b>Треки</b>\n{top(tracks)}\n\n"
+        f"<b>Исполнители</b>\n{top(artists)}\n\n"
+        f"<b>Станции</b>\n{top(stations)}"
+    )
 
 
 def station_health_state(
@@ -224,6 +266,18 @@ def result_keyboard(
     rows = []
     if track:
         rows.append(music_links(track))
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="💚 Сохранить в Spotify",
+                    callback_data=f"save_spotify:{station.key}",
+                ),
+                InlineKeyboardButton(
+                    text="💛 Сохранить в Яндекс",
+                    callback_data=f"save_yandex:{station.key}",
+                ),
+            ]
+        )
     rows.extend(
         [
             [
@@ -543,6 +597,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
     semaphore = asyncio.Semaphore(3)
     failure_threshold = positive_env_int("SOURCE_FAILURE_THRESHOLD", 3)
     stale_minutes = positive_env_int("SOURCE_STALE_MINUTES", 30)
+    last_backup_date: str | None = None
 
     async def read_station(
         station: Station,
@@ -616,21 +671,38 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                         )
                         liked_tracks.extend(yandex_tracks)
 
-                if not liked_tracks:
-                    continue
-
                 selected_stations = spotify_store.notification_station_keys(
                     telegram_user_id, ALL_STATION_KEYS
                 )
+                artist_filter, repeat_days = spotify_store.notification_rule(
+                    telegram_user_id
+                )
+                if not liked_tracks and not artist_filter:
+                    continue
                 for station, radio_track, _ in station_tracks:
                     if not radio_track or station.key not in selected_stations:
                         continue
-                    matched = any(
+                    if artist_filter and normalize_track(
+                        artist_filter
+                    ) not in normalize_track(radio_track.partition(" - ")[0]):
+                        continue
+                    artist_matched = bool(
+                        artist_filter
+                        and normalize_track(artist_filter)
+                        in normalize_track(radio_track.partition(" - ")[0])
+                    )
+                    matched = artist_matched or any(
                         tracks_match(radio_track, track.artist, track.title)
                         for track in liked_tracks
                     )
-                    if not matched or not spotify_store.mark_notification(
-                        telegram_user_id, station.key, radio_track
+                    if (
+                        not matched
+                        or spotify_store.recently_matched(
+                            telegram_user_id, radio_track, repeat_days
+                        )
+                        or not spotify_store.mark_notification(
+                            telegram_user_id, station.key, radio_track
+                        )
                     ):
                         continue
                     quiet = is_quiet_time(
@@ -663,6 +735,19 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                         telegram_user_id, build_daily_digest(telegram_user_id, date)
                     )
                     spotify_store.mark_digest_sent(telegram_user_id, date)
+            now = datetime.now(MOSCOW_TZ)
+            if now.hour >= 4 and last_backup_date != now.date().isoformat():
+                backup = BACKUP_DIR / f"radio-{now:%Y%m%d}.sqlite3"
+                spotify_store.backup_to(backup)
+                for old_backup in sorted(BACKUP_DIR.glob("radio-*.sqlite3"))[:-7]:
+                    old_backup.unlink()
+                last_backup_date = now.date().isoformat()
+                logger.info("BACKUP OK | path=%s", backup)
+                admin_id = int(os.getenv("ADMIN_USER_ID", "0") or 0)
+                if admin_id:
+                    await bot.send_message(
+                        admin_id, "✅ Ежедневная копия SQLite создана"
+                    )
             available_count = sum(1 for _, track, _ in station_tracks if track)
             unavailable = [
                 station.key for station, track, _ in station_tracks if not track
@@ -725,7 +810,15 @@ async def spotify_callback(request: web.Request) -> web.Response:
 
 async def health_check(_: web.Request) -> web.Response:
     """Confirm to the hosting platform that the bot process is alive."""
-    return web.Response(text="OK")
+    return web.json_response(
+        {
+            "status": "ok",
+            "version": APP_VERSION,
+            "uptime_seconds": int(
+                (datetime.now(MOSCOW_TZ) - STARTED_AT).total_seconds()
+            ),
+        }
+    )
 
 
 async def build_summary() -> str:
@@ -958,6 +1051,49 @@ async def station_history(callback: CallbackQuery) -> None:
     )
 
 
+@router.callback_query(F.data.startswith("save_spotify:"))
+async def save_current_to_spotify(callback: CallbackQuery) -> None:
+    station = STATIONS_BY_KEY.get((callback.data or "").partition(":")[2])
+    if station is None or radio_service is None:
+        return
+    token = await get_spotify_access_token(callback.from_user.id)
+    if not token:
+        await callback.answer("Сначала подключите Spotify", show_alert=True)
+        return
+    track = await radio_service.now_playing(station)
+    if not track:
+        await callback.answer("Сейчас нет данных о треке", show_alert=True)
+        return
+    try:
+        saved = await save_track_to_spotify(radio_service.session, token, track)
+    except SpotifyError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    assert spotify_store is not None
+    spotify_store.reset_spotify_sync_attempt(callback.from_user.id)
+    await callback.answer(f"Добавлено: {saved.artist} — {saved.title}", show_alert=True)
+
+
+@router.callback_query(F.data.startswith("save_yandex:"))
+async def save_current_to_yandex(callback: CallbackQuery) -> None:
+    assert spotify_store is not None
+    station = STATIONS_BY_KEY.get((callback.data or "").partition(":")[2])
+    token = spotify_store.get_yandex_token(callback.from_user.id)
+    if station is None or radio_service is None or token is None:
+        await callback.answer("Сначала подключите Яндекс Музыку", show_alert=True)
+        return
+    track = await radio_service.now_playing(station)
+    if not track:
+        await callback.answer("Сейчас нет данных о треке", show_alert=True)
+        return
+    try:
+        saved = await save_track_to_yandex(token.access_token, track)
+    except YandexMusicError as exc:
+        await callback.answer(str(exc), show_alert=True)
+        return
+    await callback.answer(f"Добавлено: {saved.artist} — {saved.title}", show_alert=True)
+
+
 @router.message(Command("admin_sources"))
 async def admin_source_status(message: Message) -> None:
     admin_user_id = int(os.getenv("ADMIN_USER_ID", "0") or 0)
@@ -992,6 +1128,141 @@ async def admin_source_status(message: Message) -> None:
         elif track:
             lines.append(f"   {html.escape(str(track))}")
     await message.answer("\n".join(lines))
+
+
+@router.message(Command("admin"))
+async def admin_panel(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    assert spotify_store is not None
+    uptime = datetime.now(MOSCOW_TZ) - STARTED_AT
+    statuses = spotify_store.station_statuses()
+    healthy = sum(1 for row in statuses if not row[4])
+    await message.answer(
+        "🛠 <b>Администрирование</b>\n\n"
+        f"Версия: <code>{APP_VERSION}</code>\n"
+        f"Работает: {int(uptime.total_seconds() // 3600)} ч.\n"
+        f"Пользователей: {spotify_store.user_count()}\n"
+        f"Источников с ответом: {healthy}/{len(STATIONS)}\n"
+        f"Размер базы: {DATABASE_PATH.stat().st_size // 1024 if DATABASE_PATH.exists() else 0} КБ\n\n"
+        "Команды: /admin_sources, /stats, /export, /backup, /version"
+    )
+
+
+@router.message(Command("version"))
+async def show_version(message: Message) -> None:
+    await message.answer(f"Версия сборки: <code>{APP_VERSION}</code>")
+
+
+@router.message(Command("stats"))
+async def show_statistics(message: Message) -> None:
+    await message.answer(airplay_statistics())
+
+
+@router.message(Command("export"))
+async def export_airplay(message: Message) -> None:
+    assert spotify_store is not None
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["station", "track", "played_at"])
+    writer.writerows(spotify_store.airplay_rows(30))
+    await message.answer_document(
+        BufferedInputFile(
+            output.getvalue().encode("utf-8-sig"), filename="airplay-30-days.csv"
+        )
+    )
+
+
+@router.message(Command("backup"))
+async def backup_database(message: Message) -> None:
+    if not is_admin(message.from_user.id if message.from_user else 0):
+        return
+    assert spotify_store is not None
+    backup = BACKUP_DIR / f"radio-{datetime.now(MOSCOW_TZ):%Y%m%d-%H%M%S}.sqlite3"
+    spotify_store.backup_to(backup)
+    await message.answer_document(
+        BufferedInputFile(backup.read_bytes(), filename=backup.name),
+        caption="✅ Резервная копия SQLite",
+    )
+
+
+@router.message(Command("watch"))
+async def set_artist_watch(message: Message) -> None:
+    assert spotify_store is not None
+    value = (message.text or "").partition(" ")[2].strip()
+    if not value:
+        await message.answer("Использование: <code>/watch исполнитель</code>")
+        return
+    spotify_store.set_artist_filter(message.from_user.id, value)
+    await message.answer(
+        f"Уведомления оставлены только для: <b>{html.escape(value)}</b>"
+    )
+
+
+@router.message(Command("unwatch"))
+async def clear_artist_watch(message: Message) -> None:
+    assert spotify_store is not None
+    spotify_store.set_artist_filter(message.from_user.id, None)
+    await message.answer("Фильтр исполнителя отключён.")
+
+
+@router.message(Command("cooldown"))
+async def set_notification_cooldown(message: Message) -> None:
+    assert spotify_store is not None
+    raw = (message.text or "").partition(" ")[2].strip()
+    if not raw.isdigit() or not 1 <= int(raw) <= 30:
+        await message.answer(
+            "Использование: <code>/cooldown 7</code> (от 1 до 30 дней)"
+        )
+        return
+    spotify_store.set_repeat_days(message.from_user.id, int(raw))
+    await message.answer(f"Повтор одной песни — не чаще раза в {int(raw)} дн.")
+
+
+@router.message(Command("rules"))
+async def show_notification_rules(message: Message) -> None:
+    assert spotify_store is not None
+    artist, days = spotify_store.notification_rule(message.from_user.id)
+    await message.answer(
+        "🎯 <b>Персональные правила</b>\n\n"
+        f"Исполнитель: {html.escape(artist) if artist else 'любой'}\n"
+        f"Повтор трека: раз в {days} дн.\n\n"
+        "Команды: /watch, /unwatch, /cooldown"
+    )
+
+
+@router.message(Command("sync"))
+async def show_spotify_sync(message: Message) -> None:
+    assert spotify_store is not None
+    user_id = message.from_user.id
+    cached = spotify_store.cached_spotify_liked_tracks(user_id)
+    status = spotify_store.spotify_sync_status(user_id)
+    success = status[1] if status and status[1] else "ещё не выполнялась"
+    error = status[2] if status and status[2] else "нет"
+    await message.answer(
+        "🔄 <b>Синхронизация Spotify</b>\n\n"
+        f"В кеше: {len(cached)} треков\n"
+        f"Последний успех: {html.escape(str(success))}\n"
+        f"Последняя ошибка: {html.escape(str(error))}\n"
+        "Автоматическое обновление: один раз в сутки"
+    )
+
+
+@router.message(Command("sync_now"))
+async def force_spotify_sync(message: Message) -> None:
+    if not is_admin(message.from_user.id):
+        return
+    assert spotify_store is not None
+    token = await get_spotify_access_token(message.from_user.id)
+    if not token:
+        await message.answer("Spotify не подключён.")
+        return
+    spotify_store.reset_spotify_sync_attempt(message.from_user.id)
+    tracks, error = await sync_spotify_library(message.from_user.id, token)
+    await message.answer(
+        f"Синхронизация завершена. В кеше: {len(tracks)}. "
+        f"Ошибка: {html.escape(error) if error else 'нет'}."
+    )
 
 
 @router.message(Command("id"))
@@ -1077,7 +1348,7 @@ async def first_message(message: Message) -> None:
 
 
 async def main() -> None:
-    global radio_service, spotify_config, spotify_store
+    global BACKUP_DIR, DATABASE_PATH, radio_service, spotify_config, spotify_store
     load_dotenv()
     token = os.getenv("BOT_TOKEN")
     if not token:
@@ -1091,6 +1362,8 @@ async def main() -> None:
         redirect_uri=os.getenv("SPOTIFY_REDIRECT_URI", ""),
     )
     database_path = Path(os.getenv("DATABASE_PATH", "data/spotify.sqlite3"))
+    DATABASE_PATH = database_path
+    BACKUP_DIR = Path(os.getenv("BACKUP_DIR", str(database_path.parent / "backups")))
     log_dir = Path(os.getenv("LOG_DIR", "logs"))
     configure_logging(log_dir, airplay_logger)
     logger.info(
@@ -1136,6 +1409,10 @@ async def main() -> None:
                 BotCommand(command="start", description="Открыть список станций"),
                 BotCommand(command="summary", description="Сводка по всем станциям"),
                 BotCommand(command="settings", description="Настроить уведомления"),
+                BotCommand(command="stats", description="Статистика эфира"),
+                BotCommand(command="rules", description="Персональные правила"),
+                BotCommand(command="sync", description="Состояние Spotify"),
+                BotCommand(command="version", description="Версия бота"),
                 BotCommand(command="id", description="Показать мой Telegram ID"),
             ]
         )

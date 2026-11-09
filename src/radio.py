@@ -115,6 +115,26 @@ class RadioError(RuntimeError):
     """Поток или каталог радиостанций недоступен."""
 
 
+def is_plausible_track(title: str, station: Station) -> bool:
+    """Reject station labels, jingles, and malformed metadata."""
+    normalized = re.sub(r"\s+", " ", title).casefold().strip()
+    if " - " not in title or len(normalized) < 5:
+        return False
+    blocked = (
+        *station.aliases,
+        station.title.casefold(),
+        station.search_name.casefold(),
+    )
+    if any(
+        normalized == value or normalized.startswith(f"{value} -") for value in blocked
+    ):
+        return False
+    return not any(
+        marker in normalized
+        for marker in ("saint petersburg", "санкт-петербург", "реклама", "jingle")
+    )
+
+
 def parse_icy_metadata(block: bytes) -> str | None:
     """Извлекает StreamTitle из ICY-блока, учитывая русские кодировки."""
     raw = block.rstrip(b"\0")
@@ -230,6 +250,7 @@ class RadioService:
             station.official_url
             and station.official_parser
             and (title := await self._read_official_page(station))
+            and is_plausible_track(title, station)
         ):
             return title
 
@@ -244,7 +265,7 @@ class RadioService:
         try:
             for task in asyncio.as_completed(tasks):
                 try:
-                    if title := await task:
+                    if (title := await task) and is_plausible_track(title, station):
                         return title
                 except RadioError as exc:
                     errors.append(exc)

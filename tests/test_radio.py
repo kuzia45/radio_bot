@@ -1,6 +1,11 @@
 import unittest
 
-from src.radio import STATIONS_BY_KEY, parse_icy_metadata, parse_official_page
+from src.radio import (
+    STATIONS_BY_KEY,
+    is_plausible_track,
+    parse_icy_metadata,
+    parse_official_page,
+)
 
 
 class ParseIcyMetadataTests(unittest.TestCase):
@@ -90,6 +95,12 @@ class ParseIcyMetadataTests(unittest.TestCase):
 
     def test_missing_title(self) -> None:
         self.assertIsNone(parse_icy_metadata(b"StreamUrl='https://example.com';"))
+
+    def test_station_labels_are_not_tracks(self) -> None:
+        station = STATIONS_BY_KEY["europa"]
+        self.assertFalse(is_plausible_track("Europa Plus Saint Petersburg", station))
+        self.assertFalse(is_plausible_track("Europa Plus - Saint Petersburg", station))
+        self.assertTrue(is_plausible_track("Muse - Uprising", station))
 
 
 if __name__ == "__main__":

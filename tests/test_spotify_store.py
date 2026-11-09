@@ -109,6 +109,12 @@ class SpotifyStoreTests(unittest.TestCase):
         self.store.save_spotify_sync_error(42, "quota")
         self.assertEqual(self.store.spotify_sync_status(42)[2], "quota")
 
+    def test_personal_notification_rules(self) -> None:
+        self.assertEqual(self.store.notification_rule(42), (None, 7))
+        self.store.set_artist_filter(42, "Muse")
+        self.store.set_repeat_days(42, 14)
+        self.assertEqual(self.store.notification_rule(42), ("Muse", 14))
+
 
 if __name__ == "__main__":
     unittest.main()

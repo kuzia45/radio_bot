@@ -16,7 +16,7 @@ import aiohttp
 
 SPOTIFY_AUTHORIZE_URL = "https://accounts.spotify.com/authorize"
 SPOTIFY_SAVED_TRACKS_URL = "https://api.spotify.com/v1/me/tracks"
-SPOTIFY_SCOPES = "user-library-read"
+SPOTIFY_SCOPES = "user-library-read user-library-modify"
 logger = logging.getLogger(__name__)
 
 
@@ -46,6 +46,38 @@ class SpotifyOAuthToken:
 
 class SpotifyError(RuntimeError):
     """Spotify could not return the user's saved tracks."""
+
+
+async def save_track_to_spotify(
+    session: aiohttp.ClientSession, access_token: str, query: str
+) -> SpotifyTrack:
+    """Find the closest Spotify track and add it to the user's library."""
+    headers = {"Authorization": f"Bearer {access_token}"}
+    try:
+        async with session.get(
+            "https://api.spotify.com/v1/search",
+            params={"q": query, "type": "track", "limit": 1},
+            headers=headers,
+        ) as response:
+            await _raise_spotify_api_error(response)
+            payload = await response.json(content_type=None)
+        items = payload.get("tracks", {}).get("items", [])
+        if not items:
+            raise SpotifyError("Spotify could not find this track")
+        item = items[0]
+        uri = str(item["uri"])
+        artist = ", ".join(value["name"] for value in item.get("artists", []))
+        title = str(item["name"])
+        async with session.put(
+            "https://api.spotify.com/v1/me/library",
+            json={"uris": [uri]},
+            headers=headers,
+        ) as response:
+            await _raise_spotify_api_error(response)
+        return SpotifyTrack(artist=artist, title=title)
+    except (aiohttp.ClientError, KeyError, TypeError, ValueError) as exc:
+        logger.warning("SPOTIFY SAVE ERROR | type=%s", type(exc).__name__)
+        raise SpotifyError("Spotify could not save this track") from exc
 
 
 async def _raise_spotify_api_error(response: aiohttp.ClientResponse) -> None:

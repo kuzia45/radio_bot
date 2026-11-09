@@ -57,3 +57,20 @@ async def fetch_yandex_liked_tracks(
         return result
     except LibraryYandexMusicError as exc:
         raise YandexMusicError("Яндекс Музыка временно недоступна") from exc
+
+
+async def save_track_to_yandex(access_token: str, query: str) -> SpotifyTrack:
+    """Find a track in Yandex Music and add it to likes."""
+    try:
+        client = await ClientAsync(access_token).init()
+        search = await client.search(query, type_="track")
+        results = search.tracks.results if search and search.tracks else []
+        if not results:
+            raise YandexMusicError("Яндекс Музыка не нашла этот трек")
+        track = results[0]
+        if not await client.users_likes_tracks_add(track.id):
+            raise YandexMusicError("Яндекс Музыка не подтвердила добавление")
+        artists = ", ".join(artist.name for artist in track.artists if artist.name)
+        return SpotifyTrack(artist=artists, title=track.title)
+    except LibraryYandexMusicError as exc:
+        raise YandexMusicError("Не удалось добавить трек в Яндекс Музыку") from exc

@@ -134,6 +134,11 @@ class SpotifyStore:
                 state TEXT NOT NULL,
                 changed_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS notification_rules (
+                telegram_user_id INTEGER PRIMARY KEY,
+                artist_filter TEXT,
+                repeat_days INTEGER NOT NULL DEFAULT 7
+            );
             CREATE TABLE IF NOT EXISTS yandex_tokens (
                 telegram_user_id INTEGER PRIMARY KEY,
                 access_token TEXT NOT NULL,
@@ -465,6 +470,68 @@ class SpotifyStore:
             (str(key), str(track), str(matched_at), bool(delivered))
             for key, track, matched_at, delivered in rows
         ]
+
+    def set_artist_filter(self, telegram_user_id: int, value: str | None) -> None:
+        self.connection.execute(
+            "INSERT INTO notification_rules (telegram_user_id, artist_filter) "
+            "VALUES (?, ?) ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "artist_filter = excluded.artist_filter",
+            (telegram_user_id, value),
+        )
+        self.connection.commit()
+
+    def notification_rule(self, telegram_user_id: int) -> tuple[str | None, int]:
+        row = self.connection.execute(
+            "SELECT artist_filter, repeat_days FROM notification_rules "
+            "WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ).fetchone()
+        return (row[0], int(row[1])) if row else (None, 7)
+
+    def set_repeat_days(self, telegram_user_id: int, days: int) -> None:
+        self.connection.execute(
+            "INSERT INTO notification_rules (telegram_user_id, repeat_days) "
+            "VALUES (?, ?) ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "repeat_days = excluded.repeat_days",
+            (telegram_user_id, days),
+        )
+        self.connection.commit()
+
+    def recently_matched(
+        self, telegram_user_id: int, radio_track: str, days: int
+    ) -> bool:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        row = self.connection.execute(
+            "SELECT 1 FROM notification_history WHERE telegram_user_id = ? "
+            "AND radio_track = ? AND datetime(matched_at) >= datetime(?) LIMIT 1",
+            (telegram_user_id, radio_track, cutoff),
+        ).fetchone()
+        return row is not None
+
+    def airplay_rows(self, days: int = 30) -> list[tuple]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        return self.connection.execute(
+            "SELECT station_key, track, played_at FROM airplay_history "
+            "WHERE datetime(played_at) >= datetime(?) ORDER BY played_at DESC",
+            (cutoff,),
+        ).fetchall()
+
+    def user_count(self) -> int:
+        row = self.connection.execute(
+            "SELECT COUNT(*) FROM (SELECT telegram_user_id FROM spotify_tokens "
+            "UNION SELECT telegram_user_id FROM yandex_tokens "
+            "UNION SELECT telegram_user_id FROM user_settings)"
+        ).fetchone()
+        return int(row[0]) if row else 0
+
+    def backup_to(self, path: Path) -> None:
+        """Create a transactionally consistent SQLite backup."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        target = sqlite3.connect(path)
+        try:
+            self.connection.backup(target)
+        finally:
+            target.close()
 
     def digest_due(self, telegram_user_id: int, date: str, hour: int) -> bool:
         self._ensure_settings(telegram_user_id)
