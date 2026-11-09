@@ -77,6 +77,13 @@ class SpotifyStoreTests(unittest.TestCase):
         self.store.mark_digest_sent(42, date)
         self.assertFalse(self.store.digest_due(42, date, 20))
 
+    def test_station_health_only_reports_transitions(self) -> None:
+        self.assertEqual(self.store.set_station_health("maximum", "healthy"), "unknown")
+        self.assertIsNone(self.store.set_station_health("maximum", "healthy"))
+        self.assertEqual(self.store.set_station_health("maximum", "stale"), "healthy")
+        self.assertIsNone(self.store.set_station_health("maximum", "stale"))
+        self.assertEqual(self.store.set_station_health("maximum", "healthy"), "stale")
+
 
 if __name__ == "__main__":
     unittest.main()

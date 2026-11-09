@@ -116,6 +116,11 @@ class SpotifyStore:
                 consecutive_failures INTEGER NOT NULL DEFAULT 0,
                 last_error TEXT
             );
+            CREATE TABLE IF NOT EXISTS station_health (
+                station_key TEXT PRIMARY KEY,
+                state TEXT NOT NULL,
+                changed_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS yandex_tokens (
                 telegram_user_id INTEGER PRIMARY KEY,
                 access_token TEXT NOT NULL,
@@ -421,6 +426,24 @@ class SpotifyStore:
             "SELECT station_key, current_track, last_success_at, last_change_at, "
             "consecutive_failures, last_error FROM station_status"
         ).fetchall()
+
+    def set_station_health(self, station_key: str, state: str) -> str | None:
+        """Persist a health state and return the previous state when it changed."""
+        row = self.connection.execute(
+            "SELECT state FROM station_health WHERE station_key = ?",
+            (station_key,),
+        ).fetchone()
+        previous = str(row[0]) if row else "unknown"
+        if previous == state:
+            return None
+        self.connection.execute(
+            "INSERT INTO station_health VALUES (?, ?, ?) "
+            "ON CONFLICT(station_key) DO UPDATE SET "
+            "state = excluded.state, changed_at = excluded.changed_at",
+            (station_key, state, self._now()),
+        )
+        self.connection.commit()
+        return previous
 
     def _ensure_settings(self, telegram_user_id: int) -> None:
         self.connection.execute(

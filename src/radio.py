@@ -76,8 +76,8 @@ STATIONS: tuple[Station, ...] = (
         "Европа Плюс",
         "Европа Плюс",
         ("европа плюс", "europa plus"),
-        "https://fmgo.net/api/nowplaying?slug=evropa-plyus",
-        "json_title",
+        "https://volna.top/playlist/radio/europa-plus",
+        "volna_top",
     ),
     Station("dfm", "ДФМ", "DFM", ("dfm", "дфм", "динамит fm")),
     Station("record", "Рекорд", "Radio Record", ("radio record", "радио рекорд")),
@@ -212,6 +212,11 @@ def parse_official_page(page: str, parser: str, slug: str | None = None) -> str 
         )
         if latest:
             return f"{html.unescape(latest.group(2)).strip()} - {html.unescape(latest.group(1)).strip()}"
+
+    if parser == "volna_top":
+        current = re.search(r"Сейчас играет:\s*([^<]+)", page, re.IGNORECASE)
+        if current:
+            return re.sub(r"\s+", " ", html.unescape(current.group(1))).strip() or None
     return None
 
 

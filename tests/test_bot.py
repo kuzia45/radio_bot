@@ -1,6 +1,7 @@
 import unittest
+from datetime import datetime, timedelta
 
-from src.bot import is_quiet_time, should_log_airplay
+from src.bot import MOSCOW_TZ, is_quiet_time, should_log_airplay, station_health_state
 
 
 class AirplayLoggingTests(unittest.TestCase):
@@ -19,6 +20,23 @@ class AirplayLoggingTests(unittest.TestCase):
         self.assertTrue(is_quiet_time(7, (23, 8)))
         self.assertFalse(is_quiet_time(12, (23, 8)))
         self.assertFalse(is_quiet_time(23, None))
+
+    def test_station_health_detects_failures_and_stale_track(self) -> None:
+        now = datetime(2026, 11, 9, 18, 0, tzinfo=MOSCOW_TZ)
+        healthy = ("maximum", "Muse - Uprising", None, now.isoformat(), 0, None)
+        stale = (
+            "maximum",
+            "Muse - Uprising",
+            None,
+            (now - timedelta(minutes=31)).isoformat(),
+            0,
+            None,
+        )
+        unavailable = ("maximum", None, None, None, 3, "timeout")
+
+        self.assertEqual(station_health_state(healthy, now), "healthy")
+        self.assertEqual(station_health_state(stale, now), "stale")
+        self.assertEqual(station_health_state(unavailable, now), "unavailable")
 
 
 if __name__ == "__main__":

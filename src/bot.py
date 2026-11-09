@@ -76,6 +76,97 @@ def should_log_airplay(
     return True
 
 
+def positive_env_int(name: str, default: int) -> int:
+    """Read a positive integer setting without breaking bot startup."""
+    try:
+        return max(1, int(os.getenv(name, str(default))))
+    except ValueError:
+        logger.warning("INVALID SETTING | %s | using=%s", name, default)
+        return default
+
+
+def station_health_state(
+    status: tuple,
+    now: datetime,
+    failure_threshold: int = 3,
+    stale_minutes: int = 30,
+) -> str:
+    """Classify a station as healthy, unavailable, or stale."""
+    _key, _track, _success_at, change_at, failures, _error = status
+    if int(failures) >= failure_threshold:
+        return "unavailable"
+    if change_at:
+        changed = datetime.fromisoformat(str(change_at)).astimezone(MOSCOW_TZ)
+        age_minutes = (now - changed).total_seconds() / 60
+        if age_minutes >= stale_minutes:
+            return "stale"
+    return "healthy"
+
+
+async def report_station_health(
+    bot: Bot,
+    station: Station,
+    status: tuple,
+    now: datetime,
+    failure_threshold: int,
+    stale_minutes: int,
+) -> None:
+    """Log health transitions and notify the configured administrator."""
+    assert spotify_store is not None
+    state = station_health_state(status, now, failure_threshold, stale_minutes)
+    previous = spotify_store.set_station_health(station.key, state)
+    if previous is None or previous == state:
+        return
+    if previous == "unknown" and state == "healthy":
+        return
+
+    _key, track, _success_at, change_at, failures, error = status
+    admin_user_id = int(os.getenv("ADMIN_USER_ID", "0") or 0)
+    if state == "healthy":
+        logger.info(
+            "SOURCE RECOVERED | station=%s | previous=%s", station.key, previous
+        )
+        message = (
+            f"🟢 <b>{html.escape(station.title)} снова работает</b>\n\n"
+            f"Сейчас играет: <b>{html.escape(str(track))}</b>"
+        )
+    elif state == "unavailable":
+        logger.error(
+            "SOURCE UNAVAILABLE | station=%s | failures=%s | error=%s",
+            station.key,
+            failures,
+            error,
+        )
+        message = (
+            f"🔴 <b>Источник {html.escape(station.title)} недоступен</b>\n\n"
+            f"Ошибок подряд: {int(failures)}\n"
+            f"Причина: {html.escape(str(error or 'нет данных'))}"
+        )
+    else:
+        changed = datetime.fromisoformat(str(change_at)).astimezone(MOSCOW_TZ)
+        minutes = int((now - changed).total_seconds() // 60)
+        logger.warning(
+            "SOURCE STALE | station=%s | minutes=%s | track=%s",
+            station.key,
+            minutes,
+            track,
+        )
+        message = (
+            f"🟡 <b>Возможно, завис источник {html.escape(station.title)}</b>\n\n"
+            f"Трек не менялся {minutes} мин.:\n"
+            f"<b>{html.escape(str(track))}</b>"
+        )
+
+    if not admin_user_id:
+        return
+    try:
+        await bot.send_message(admin_user_id, message)
+    except Exception:
+        logger.exception(
+            "ADMIN ALERT FAILED | station=%s | state=%s", station.key, state
+        )
+
+
 def stations_keyboard(page: int = 0) -> InlineKeyboardMarkup:
     page_count = (len(STATIONS) + STATIONS_PER_PAGE - 1) // STATIONS_PER_PAGE
     page = max(0, min(page, page_count - 1))
@@ -410,6 +501,8 @@ async def spotify_notification_monitor(bot: Bot) -> None:
     liked_cache: dict[tuple[str, int], tuple[float, list]] = {}
     airplay_state: dict[str, tuple[str, float]] = {}
     semaphore = asyncio.Semaphore(3)
+    failure_threshold = positive_env_int("SOURCE_FAILURE_THRESHOLD", 3)
+    stale_minutes = positive_env_int("SOURCE_STALE_MINUTES", 30)
 
     async def read_station(
         station: Station,
@@ -437,6 +530,20 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                 ):
                     airplay_logger.info("%s — %s", station.title, radio_track)
                     spotify_store.record_airplay(station.key, radio_track)
+
+            statuses = {row[0]: row for row in spotify_store.station_statuses()}
+            checked_at_datetime = datetime.now(MOSCOW_TZ)
+            for station in STATIONS:
+                status = statuses.get(station.key)
+                if status:
+                    await report_station_health(
+                        bot,
+                        station,
+                        status,
+                        checked_at_datetime,
+                        failure_threshold,
+                        stale_minutes,
+                    )
 
             user_ids = spotify_store.music_user_ids()
             matches_found = 0

@@ -62,6 +62,10 @@ class ParseIcyMetadataTests(unittest.TestCase):
         )
         self.assertEqual(parse_official_page(page, "europa_playlist"), "A & B - Song")
 
+    def test_volna_top(self) -> None:
+        page = "<p class='supertext'>Сейчас играет: A &amp; B - New Song</p>"
+        self.assertEqual(parse_official_page(page, "volna_top"), "A & B - New Song")
+
     def test_json_title(self) -> None:
         page = '{"ok": true, "title": "Artist  -  Song"}'
         self.assertEqual(parse_official_page(page, "json_title"), "Artist - Song")
