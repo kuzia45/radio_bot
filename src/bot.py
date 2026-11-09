@@ -21,6 +21,7 @@ from aiogram.filters import Command, CommandStart
 from aiogram.types import (
     BotCommand,
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -268,7 +269,17 @@ async def connect_yandex_music(message: Message) -> None:
     async def show_code(code) -> None:
         keyboard = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Открыть Яндекс", url=code.verification_url)]
+                [
+                    InlineKeyboardButton(
+                        text="📋 Скопировать код",
+                        copy_text=CopyTextButton(text=code.user_code),
+                    )
+                ],
+                [
+                    InlineKeyboardButton(
+                        text="Открыть Яндекс", url=code.verification_url
+                    )
+                ],
             ]
         )
         await message.answer(
