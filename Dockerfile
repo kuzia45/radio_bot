@@ -6,7 +6,9 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
 WORKDIR /app
 
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN echo "[BUILD] Installing Python dependencies..." \
+    && pip install --no-cache-dir --disable-pip-version-check --quiet -r requirements.txt \
+    && echo "[BUILD] Dependencies installed successfully."
 
 COPY src ./src
 
