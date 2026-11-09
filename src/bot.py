@@ -37,10 +37,10 @@ from src.radio import STATIONS, STATIONS_BY_KEY, RadioError, RadioService, Stati
 from src.spotify import (
     SpotifyConfig,
     SpotifyError,
+    SpotifyTrack,
     create_authorization_url,
     exchange_authorization_code,
     fetch_all_liked_tracks,
-    fetch_recent_liked_tracks,
     refresh_access_token,
     tracks_match,
 )
@@ -332,24 +332,25 @@ async def recent_liked_tracks(message: Message) -> None:
         )
         return
 
-    assert radio_service is not None
-    try:
-        tracks = await fetch_recent_liked_tracks(
-            radio_service.session, access_token, limit=10
-        )
-    except SpotifyError as exc:
-        await message.answer(f"⚠️ {html.escape(str(exc))}. Подключите Spotify заново.")
-        return
+    tracks, sync_error = await sync_spotify_library(telegram_user_id, access_token)
 
     if not tracks:
-        await message.answer("В Spotify пока нет сохранённых треков.")
+        if sync_error:
+            await message.answer(
+                f"⚠️ {html.escape(sync_error)}. Следующая синхронизация — завтра."
+            )
+        else:
+            await message.answer("В Spotify пока нет сохранённых треков.")
         return
 
     lines = [
         f"{index}. <b>{html.escape(track.artist)}</b> — {html.escape(track.title)}"
-        for index, track in enumerate(tracks, start=1)
+        for index, track in enumerate(tracks[:10], start=1)
     ]
-    await message.answer("💚 <b>Последние лайки Spotify</b>\n\n" + "\n".join(lines))
+    suffix = f"\n\n⚠️ Последний кеш: {html.escape(sync_error)}" if sync_error else ""
+    await message.answer(
+        "💚 <b>Последние лайки Spotify</b>\n\n" + "\n".join(lines) + suffix
+    )
 
 
 @router.message(Command("yandex"))
@@ -462,6 +463,7 @@ async def pasted_spotify_callback(message: Message) -> None:
         telegram_user_id,
         StoredSpotifyToken(token.access_token, token.refresh_token, token.expires_at),
     )
+    spotify_store.reset_spotify_sync_attempt(telegram_user_id)
     try:
         await message.delete()
     except TelegramBadRequest:
@@ -494,6 +496,44 @@ async def get_spotify_access_token(telegram_user_id: int) -> str | None:
         ),
     )
     return refreshed.access_token
+
+
+async def sync_spotify_library(
+    telegram_user_id: int, access_token: str
+) -> tuple[list[SpotifyTrack], str | None]:
+    """Refresh a user's Spotify library at most once per Moscow calendar day."""
+    assert spotify_store is not None and radio_service is not None
+    date = datetime.now(MOSCOW_TZ).date().isoformat()
+    sync_error: str | None = None
+    if spotify_store.spotify_sync_due(telegram_user_id, date):
+        spotify_store.mark_spotify_sync_attempt(telegram_user_id, date)
+        try:
+            tracks = await fetch_all_liked_tracks(radio_service.session, access_token)
+        except SpotifyError as exc:
+            sync_error = str(exc)
+            spotify_store.save_spotify_sync_error(telegram_user_id, sync_error)
+            logger.warning(
+                "SPOTIFY SYNC FAILED | user=%s | error=%s",
+                telegram_user_id,
+                sync_error,
+            )
+        else:
+            spotify_store.save_spotify_liked_tracks(
+                telegram_user_id,
+                [(track.artist, track.title) for track in tracks],
+            )
+            logger.info(
+                "SPOTIFY SYNC OK | user=%s | tracks=%s",
+                telegram_user_id,
+                len(tracks),
+            )
+
+    cached = spotify_store.cached_spotify_liked_tracks(telegram_user_id)
+    if sync_error is None:
+        status = spotify_store.spotify_sync_status(telegram_user_id)
+        if status and status[2]:
+            sync_error = str(status[2])
+    return [SpotifyTrack(artist, title) for artist, title in cached], sync_error
 
 
 async def spotify_notification_monitor(bot: Bot) -> None:
@@ -552,22 +592,10 @@ async def spotify_notification_monitor(bot: Bot) -> None:
                 liked_tracks = []
                 access_token = await get_spotify_access_token(telegram_user_id)
                 if access_token:
-                    cache_key = ("spotify", telegram_user_id)
-                    cached = liked_cache.get(cache_key)
-                    if cached and cached[0] > time.monotonic():
-                        liked_tracks.extend(cached[1])
-                    else:
-                        try:
-                            spotify_tracks = await fetch_all_liked_tracks(
-                                radio_service.session, access_token
-                            )
-                        except SpotifyError:
-                            spotify_tracks = []
-                        liked_cache[cache_key] = (
-                            time.monotonic() + 10 * 60,
-                            spotify_tracks,
-                        )
-                        liked_tracks.extend(spotify_tracks)
+                    spotify_tracks, _sync_error = await sync_spotify_library(
+                        telegram_user_id, access_token
+                    )
+                    liked_tracks.extend(spotify_tracks)
 
                 yandex_token = spotify_store.get_yandex_token(telegram_user_id)
                 if yandex_token:
@@ -682,6 +710,7 @@ async def spotify_callback(request: web.Request) -> web.Response:
         telegram_user_id,
         StoredSpotifyToken(token.access_token, token.refresh_token, token.expires_at),
     )
+    spotify_store.reset_spotify_sync_attempt(telegram_user_id)
     logger.info("SPOTIFY CONNECTED | user=%s", telegram_user_id)
     bot: Bot = request.app["bot"]
     await bot.send_message(

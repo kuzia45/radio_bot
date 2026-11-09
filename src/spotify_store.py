@@ -75,6 +75,19 @@ class SpotifyStore:
                 track TEXT NOT NULL,
                 played_at TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS spotify_liked_tracks (
+                telegram_user_id INTEGER NOT NULL,
+                position INTEGER NOT NULL,
+                artist TEXT NOT NULL,
+                title TEXT NOT NULL,
+                PRIMARY KEY (telegram_user_id, position)
+            );
+            CREATE TABLE IF NOT EXISTS spotify_library_sync (
+                telegram_user_id INTEGER PRIMARY KEY,
+                last_attempt_date TEXT,
+                last_success_at TEXT,
+                last_error TEXT
+            );
             CREATE INDEX IF NOT EXISTS idx_airplay_station_time
                 ON airplay_history (station_key, played_at DESC);
 
@@ -171,6 +184,85 @@ class SpotifyStore:
             (telegram_user_id,),
         ).fetchone()
         return StoredSpotifyToken(*row) if row else None
+
+    def spotify_sync_due(self, telegram_user_id: int, date: str) -> bool:
+        row = self.connection.execute(
+            "SELECT last_attempt_date FROM spotify_library_sync "
+            "WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ).fetchone()
+        return not row or row[0] != date
+
+    def mark_spotify_sync_attempt(self, telegram_user_id: int, date: str) -> None:
+        self.connection.execute(
+            "INSERT INTO spotify_library_sync "
+            "(telegram_user_id, last_attempt_date) VALUES (?, ?) "
+            "ON CONFLICT(telegram_user_id) DO UPDATE SET "
+            "last_attempt_date = excluded.last_attempt_date",
+            (telegram_user_id, date),
+        )
+        self.connection.commit()
+
+    def reset_spotify_sync_attempt(self, telegram_user_id: int) -> None:
+        """Allow a fresh library sync after the user reconnects Spotify."""
+        self.connection.execute(
+            "UPDATE spotify_library_sync SET last_attempt_date = NULL "
+            "WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        )
+        self.connection.commit()
+
+    def save_spotify_liked_tracks(
+        self, telegram_user_id: int, tracks: list[tuple[str, str]]
+    ) -> None:
+        """Replace a user's cached Spotify library after a successful sync."""
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM spotify_liked_tracks WHERE telegram_user_id = ?",
+                (telegram_user_id,),
+            )
+            self.connection.executemany(
+                "INSERT INTO spotify_liked_tracks VALUES (?, ?, ?, ?)",
+                (
+                    (telegram_user_id, position, artist, title)
+                    for position, (artist, title) in enumerate(tracks)
+                ),
+            )
+            self.connection.execute(
+                "UPDATE spotify_library_sync SET last_success_at = ?, "
+                "last_error = NULL WHERE telegram_user_id = ?",
+                (self._now(), telegram_user_id),
+            )
+
+    def save_spotify_sync_error(self, telegram_user_id: int, error: str) -> None:
+        self.connection.execute(
+            "UPDATE spotify_library_sync SET last_error = ? WHERE telegram_user_id = ?",
+            (error, telegram_user_id),
+        )
+        self.connection.commit()
+
+    def cached_spotify_liked_tracks(
+        self, telegram_user_id: int, limit: int | None = None
+    ) -> list[tuple[str, str]]:
+        query = (
+            "SELECT artist, title FROM spotify_liked_tracks "
+            "WHERE telegram_user_id = ? ORDER BY position"
+        )
+        params: tuple[int, ...] = (telegram_user_id,)
+        if limit is not None:
+            query += " LIMIT ?"
+            params = (telegram_user_id, limit)
+        return [
+            (str(artist), str(title))
+            for artist, title in self.connection.execute(query, params).fetchall()
+        ]
+
+    def spotify_sync_status(self, telegram_user_id: int) -> tuple | None:
+        return self.connection.execute(
+            "SELECT last_attempt_date, last_success_at, last_error "
+            "FROM spotify_library_sync WHERE telegram_user_id = ?",
+            (telegram_user_id,),
+        ).fetchone()
 
     def connected_user_ids(self) -> list[int]:
         rows = self.connection.execute(

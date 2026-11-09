@@ -84,6 +84,31 @@ class SpotifyStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.set_station_health("maximum", "stale"))
         self.assertEqual(self.store.set_station_health("maximum", "healthy"), "stale")
 
+    def test_spotify_library_is_synchronized_once_per_day(self) -> None:
+        self.assertTrue(self.store.spotify_sync_due(42, "2026-11-09"))
+        self.store.mark_spotify_sync_attempt(42, "2026-11-09")
+        self.assertFalse(self.store.spotify_sync_due(42, "2026-11-09"))
+        self.assertTrue(self.store.spotify_sync_due(42, "2026-11-10"))
+        self.store.reset_spotify_sync_attempt(42)
+        self.assertTrue(self.store.spotify_sync_due(42, "2026-11-09"))
+        self.store.mark_spotify_sync_attempt(42, "2026-11-09")
+
+        self.store.save_spotify_liked_tracks(
+            42,
+            [("Muse", "Uprising"), ("Muse", "Starlight")],
+        )
+        self.assertEqual(
+            self.store.cached_spotify_liked_tracks(42, limit=1),
+            [("Muse", "Uprising")],
+        )
+        status = self.store.spotify_sync_status(42)
+        self.assertIsNotNone(status)
+        self.assertIsNotNone(status[1])
+        self.assertIsNone(status[2])
+
+        self.store.save_spotify_sync_error(42, "quota")
+        self.assertEqual(self.store.spotify_sync_status(42)[2], "quota")
+
 
 if __name__ == "__main__":
     unittest.main()
