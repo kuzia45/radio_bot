@@ -33,6 +33,19 @@ class SpotifyStoreTests(unittest.TestCase):
         self.assertEqual(self.store.get_yandex_token(43), token)
         self.assertEqual(self.store.music_user_ids(), [43])
 
+    def test_backup_uses_an_independent_database_connection(self) -> None:
+        token = StoredSpotifyToken("access", "refresh", 123)
+        self.store.save_token(42, token)
+        backup_path = Path(self.temporary_directory.name) / "backup.sqlite3"
+
+        self.store.backup_to(backup_path)
+
+        backup = SpotifyStore(backup_path)
+        try:
+            self.assertEqual(backup.get_token(42), token)
+        finally:
+            backup.close()
+
     def test_same_station_track_is_not_notified_twice(self) -> None:
         self.assertTrue(self.store.mark_notification(42, "maximum", "Muse - Uprising"))
         self.assertFalse(self.store.mark_notification(42, "maximum", "Muse - Uprising"))

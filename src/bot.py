@@ -67,7 +67,7 @@ spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
 MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 ALL_STATION_KEYS = {station.key for station in STATIONS}
-APP_VERSION = os.getenv("APP_VERSION", "2026.11.1")
+APP_VERSION = os.getenv("APP_VERSION", "2026.11.2")
 STARTED_AT = datetime.now(MOSCOW_TZ)
 DATABASE_PATH = Path("data/spotify.sqlite3")
 BACKUP_DIR = Path("data/backups")
@@ -738,7 +738,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
             now = datetime.now(MOSCOW_TZ)
             if now.hour >= 4 and last_backup_date != now.date().isoformat():
                 backup = BACKUP_DIR / f"radio-{now:%Y%m%d}.sqlite3"
-                spotify_store.backup_to(backup)
+                await asyncio.to_thread(spotify_store.backup_to, backup)
                 for old_backup in sorted(BACKUP_DIR.glob("radio-*.sqlite3"))[:-7]:
                     old_backup.unlink()
                 last_backup_date = now.date().isoformat()
@@ -1179,7 +1179,7 @@ async def backup_database(message: Message) -> None:
         return
     assert spotify_store is not None
     backup = BACKUP_DIR / f"radio-{datetime.now(MOSCOW_TZ):%Y%m%d-%H%M%S}.sqlite3"
-    spotify_store.backup_to(backup)
+    await asyncio.to_thread(spotify_store.backup_to, backup)
     await message.answer_document(
         BufferedInputFile(backup.read_bytes(), filename=backup.name),
         caption="✅ Резервная копия SQLite",

@@ -26,6 +26,7 @@ class StoredYandexToken:
 class SpotifyStore:
     def __init__(self, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = path
         self.connection = sqlite3.connect(path)
         self.connection.execute(
             """
@@ -527,11 +528,13 @@ class SpotifyStore:
     def backup_to(self, path: Path) -> None:
         """Create a transactionally consistent SQLite backup."""
         path.parent.mkdir(parents=True, exist_ok=True)
+        source = sqlite3.connect(self.path)
         target = sqlite3.connect(path)
         try:
-            self.connection.backup(target)
+            source.backup(target)
         finally:
             target.close()
+            source.close()
 
     def digest_due(self, telegram_user_id: int, date: str, hour: int) -> bool:
         self._ensure_settings(telegram_user_id)
