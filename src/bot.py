@@ -67,7 +67,7 @@ spotify_store: SpotifyStore | None = None
 STATIONS_PER_PAGE = 8
 MOSCOW_TZ = timezone(timedelta(hours=3), name="Europe/Moscow")
 ALL_STATION_KEYS = {station.key for station in STATIONS}
-APP_VERSION = os.getenv("APP_VERSION", "2026.11.2")
+APP_VERSION = os.getenv("APP_VERSION", "2026.11.3")
 STARTED_AT = datetime.now(MOSCOW_TZ)
 DATABASE_PATH = Path("data/spotify.sqlite3")
 BACKUP_DIR = Path("data/backups")
@@ -145,15 +145,14 @@ def station_health_state(
     return "healthy"
 
 
-async def report_station_health(
-    bot: Bot,
+def report_station_health(
     station: Station,
     status: tuple,
     now: datetime,
     failure_threshold: int,
     stale_minutes: int,
 ) -> None:
-    """Log health transitions and notify the configured administrator."""
+    """Persist and log source health transitions for the admin summary."""
     assert spotify_store is not None
     state = station_health_state(status, now, failure_threshold, stale_minutes)
     previous = spotify_store.set_station_health(station.key, state)
@@ -163,14 +162,9 @@ async def report_station_health(
         return
 
     _key, track, _success_at, change_at, failures, error = status
-    admin_user_id = int(os.getenv("ADMIN_USER_ID", "0") or 0)
     if state == "healthy":
         logger.info(
             "SOURCE RECOVERED | station=%s | previous=%s", station.key, previous
-        )
-        message = (
-            f"🟢 <b>{html.escape(station.title)} снова работает</b>\n\n"
-            f"Сейчас играет: <b>{html.escape(str(track))}</b>"
         )
     elif state == "unavailable":
         logger.error(
@@ -178,11 +172,6 @@ async def report_station_health(
             station.key,
             failures,
             error,
-        )
-        message = (
-            f"🔴 <b>Источник {html.escape(station.title)} недоступен</b>\n\n"
-            f"Ошибок подряд: {int(failures)}\n"
-            f"Причина: {html.escape(str(error or 'нет данных'))}"
         )
     else:
         changed = datetime.fromisoformat(str(change_at)).astimezone(MOSCOW_TZ)
@@ -192,20 +181,6 @@ async def report_station_health(
             station.key,
             minutes,
             track,
-        )
-        message = (
-            f"🟡 <b>Возможно, завис источник {html.escape(station.title)}</b>\n\n"
-            f"Трек не менялся {minutes} мин.:\n"
-            f"<b>{html.escape(str(track))}</b>"
-        )
-
-    if not admin_user_id:
-        return
-    try:
-        await bot.send_message(admin_user_id, message)
-    except Exception:
-        logger.exception(
-            "ADMIN ALERT FAILED | station=%s | state=%s", station.key, state
         )
 
 
@@ -631,8 +606,7 @@ async def spotify_notification_monitor(bot: Bot) -> None:
             for station in STATIONS:
                 status = statuses.get(station.key)
                 if status:
-                    await report_station_health(
-                        bot,
+                    report_station_health(
                         station,
                         status,
                         checked_at_datetime,
